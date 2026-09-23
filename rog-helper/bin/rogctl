@@ -203,6 +203,10 @@ cmd_status() {
   echo "dgpu_disable=$dis"
   echo "mux=$mux"
   echo "pending_reboot=$pend"
+  # what this machine has, so the panel can hide the rest (1/0)
+  echo "has_dgpu_disable=$([ -n "$dis" ] && echo 1 || echo 0)"
+  echo "has_mux=$([ -n "$mux" ] && echo 1 || echo 0)"
+  echo "has_kbd=$([ -e /sys/class/leds/asus::kbd_backlight/brightness ] && echo 1 || echo 0)"
 
   edp=$(active_edp)
   if [ -n "$edp" ]; then
@@ -217,8 +221,10 @@ cmd_status() {
     echo "scale=$scale"
     echo "position=$pos"
     echo "booted_ultimate=$on_nv"
+    echo "has_edp=1"
   else
     echo "booted_ultimate=$([ "$mux" = 0 ] && [ "$pend" != 1 ] && echo 1 || echo 0)"
+    echo "has_edp=0"
   fi
 
   echo "optimized=$(cfg_get optimized)"
@@ -229,6 +235,7 @@ cmd_status() {
   echo "kbd_max=$(rd /sys/class/leds/asus::kbd_backlight/max_brightness 3)"
 
   local bat; bat=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -n1)
+  echo "has_limit=$([ -n "$bat" ] && [ -f "$bat/charge_control_end_threshold" ] && echo 1 || echo 0)"
   if [ -n "$bat" ]; then
     echo "limit=$(rd "$bat/charge_control_end_threshold")"
     echo "battery=$(rd "$bat/capacity")"
@@ -580,7 +587,6 @@ cmd_fan() {
   local prof=${1:-} preset=${2:-} fan c d
   case "$prof" in balanced|performance) ;; turbo) prof=performance ;; *) echo "Fan curves exist for Balanced and Turbo only"; return 3 ;; esac
   case "$preset" in default|quiet|cool|reapply) ;; *) echo "usage: fan balanced|turbo default|quiet|cool"; return 2 ;; esac
-  for fan in CPU GPU; do [ -n "$(fan_default "$prof" "$fan")" ] || { echo "No stock curve recorded"; return 1; }; done
   if [ "$preset" = default ]; then
     run asusctl fan-curve --mod-profile "$prof" --enable-fan-curves false >/dev/null || return 1
     cfg_set "fan_$prof" ""
@@ -593,6 +599,11 @@ cmd_fan() {
     done < <(fan_curves "$prof")
     return 0
   fi
+  # Presets are built from the stock curve, which is only seen while custom
+  # curves are off. asusd has no read-only query for the factory curve.
+  for fan in CPU GPU; do
+    [ -n "$(fan_default "$prof" "$fan")" ] || { echo "Stock curve unknown: pick Stock (or reset curves in asusctl) first"; return 3; }
+  done
   for fan in CPU GPU; do
     d=$(fan_default "$prof" "$fan"); c=$(fan_preset "$prof" "$fan" "$preset")
     fan_valid "$c" "$d" || { echo "Rejected an unsafe $fan curve"; return 1; }
@@ -676,6 +687,8 @@ cmd_boot_sound() {
 
 cmd_status_extra() {
   local d; d=$(rapl_defaults)
+  echo "has_rapl=$([ -n "$(rapl_dirs)" ] && [ "${d% *}" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
+  echo "has_boost=$([ -n "$(boost_file)" ] && echo 1 || echo 0)"
   echo "pl1=$(rapl_w 0)"; echo "pl2=$(rapl_w 1)"
   echo "pl1_default=${d% *}"; echo "pl2_default=${d#* }"
   echo "cpu_base_power=$(( $(rd /sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw 0) / 1000000 ))"
@@ -688,23 +701,28 @@ cmd_status_extra() {
   echo "bat_silent=$(cfg_get bat_silent)"
   echo "auto_pending_ac=$(cfg_get auto_pending_ac)"; echo "auto_pending_battery=$(cfg_get auto_pending_battery)"
 
-  local prof fan t p e
+  local prof fan t p e curves=0
   for prof in balanced performance; do
     echo "fan_$prof=$(cfg_get "fan_$prof")"
     while read -r fan t p e; do
-      echo "curve_${prof}_${fan,,}=$t;$p;$e"
+      echo "curve_${prof}_${fan,,}=$t;$p;$e"; curves=1
     done < <(fan_curves "$prof")
     for fan in CPU GPU; do echo "stock_${prof}_${fan,,}=$(fan_default "$prof" "$fan")"; done
   done
+  echo "has_fan_curves=$curves"
 
   local am ac1 ac2 asp adir; read -r am ac1 ac2 asp adir <<<"$(aura_state)"
   echo "aura_mode=$am"; echo "aura_colour=$ac1"; echo "aura_colour2=$ac2"; echo "aura_speed=$asp"; echo "aura_direction=$adir"
-  asusctl slash get 2>/dev/null | awk -F': ' '/^Slash LED/ { print "slash=" ($2 == "enabled" ? 1 : 0) } /^Brightness/ { print "slash_brightness=" $2 }
+  echo "has_aura=$([ -n "$am" ] && echo 1 || echo 0)"
+  local sl; sl=$(asusctl slash get 2>/dev/null)
+  if grep -q '^Slash LED' <<<"$sl"; then echo "has_slash=1"; else echo "has_slash=0"; fi
+  printf '%s\n' "$sl" | awk -F': ' '/^Slash LED/ { print "slash=" ($2 == "enabled" ? 1 : 0) } /^Brightness/ { print "slash_brightness=" $2 }
     /^Mode/ { print "slash_mode=" $2 } /^Interval/ { print "slash_interval=" $2 }
     /^Show on battery:/ { print "slash_battery=" ($2 == "true" ? 1 : 0) } /^Show battery warning/ { print "slash_warning=" ($2 == "true" ? 1 : 0) }'
   local ap; ap=$(aura_power_state); [ -n "$ap" ] && echo "aura_power=${ap// /,}"
   echo "boot_sound=$(rd "$FA/boot_sound/current_value")"
-  echo "slash_modes=$(asusctl slash list 2>/dev/null | paste -sd, -)"
+  echo "has_boot_sound=$([ -f "$FA/boot_sound/current_value" ] && echo 1 || echo 0)"
+  [ -n "$sl" ] && echo "slash_modes=$(asusctl slash list 2>/dev/null | paste -sd, -)"
 
   local bat; bat=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -n1)
   if [ -n "$bat" ]; then
@@ -714,16 +732,17 @@ cmd_status_extra() {
   fi
 }
 
-# ── automation units (only installed when a mode that needs them is picked) ────
+# ── automation units (installed when an automation needs them) ─────────────────
 
 write_units() {
   [ "$DRY" = 1 ] && { echo "dry-run: write $UNIT_DIR/{$AUTO_UNIT,$LOGIN_UNIT}" >&9; return 0; }
   mkdir -p "$UNIT_DIR"
   cat >"$UNIT_DIR/$AUTO_UNIT" <<EOF
-# Installed by the ROG helper Noctalia plugin. Follows AC power for the
-# Optimized GPU mode and Auto refresh rate. Remove by picking another mode.
+# Installed by the ROG helper Noctalia plugin. Follows AC power and the
+# performance mode for Optimized, Auto refresh, Silent on battery, per-source
+# profiles and custom CPU limits. Disabled again when nothing needs it.
 [Unit]
-Description=ROG helper: follow AC power (GPU Optimized, screen Auto)
+Description=ROG helper: follow AC power (GPU, refresh rate, Silent, CPU limits)
 After=graphical-session.target
 PartOf=graphical-session.target
 
