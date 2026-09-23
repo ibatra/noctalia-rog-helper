@@ -2,14 +2,15 @@
 # rogctl - hardware helper behind the ROG helper Noctalia plugin.
 #
 # Everything here runs as the user. asusd accepts D-Bus writes from the
-# wheel/users groups, so asusctl needs no root. The one exception is the
-# Silent profile, which writes the per-handler platform-profile files through
-# pkexec (Noctalia's polkit agent shows the prompt).
+# wheel/users groups, so asusctl needs no root. Root (pkexec, Noctalia's polkit
+# agent shows the prompt) is only needed for CPU power limits, CPU boost, and
+# Silent when asusd doesn't offer Quiet: then the per-handler platform-profile
+# files are written directly.
 #
 # Never touches nvidia-smi/NVML: dGPU state comes from sysfs runtime PM only.
 #
 #   rogctl [--dry-run] status | status-extra      key=value snapshots
-#   rogctl [--dry-run] perf silent|balanced|turbo  (Silent: pkexec)
+#   rogctl [--dry-run] perf silent|balanced|turbo  (Silent: pkexec without asusd Quiet)
 #   rogctl [--dry-run] gpu eco|standard|optimized|ultimate
 #   rogctl [--dry-run] refresh low|max|auto
 #   rogctl [--dry-run] limit <20-100> | oneshot
@@ -259,38 +260,56 @@ cmd_status() {
 
 # ── performance ────────────────────────────────────────────────────────────────
 
+# asusd's name for Quiet when it offers it (a kernel with the soc_slider fix,
+# or an asusd that sets it per handler), empty otherwise.
+asusd_quiet() { asusctl profile list 2>/dev/null | grep -m1 -xE 'Quiet|LowPower'; }
+
 cmd_perf() {
   local src; [ "$(ac_online)" = 1 ] && src=-a || src=-b
   case "${1:-}" in
     silent)
-      local asus soc script
+      local asus soc script q rs="" rc prev=""
       asus=$(pp_handler asus-wmi)
       soc=$(pp_handler other)
       [ -n "$asus" ] || { echo "No asus-wmi platform profile"; return 1; }
-      local prev=""
       if command -v powerprofilesctl >/dev/null; then
         prev=$(powerprofilesctl get 2>/dev/null)
         run powerprofilesctl set power-saver
       fi
-      script="echo quiet > $asus/profile"
-      if [ -n "$soc" ] && grep -qw low-power "$soc/choices" 2>/dev/null; then
-        script="$script && echo low-power > $soc/profile"
+      q=$(asusd_quiet)
+      if [ -n "$q" ]; then
+        # asusd can hold Quiet itself: no password for the profile.
+        run asusctl profile set "$src" "$q" >/dev/null; rc=$?
+      else
+        script="echo quiet > $asus/profile"
+        if [ -n "$soc" ] && grep -qw low-power "$soc/choices" 2>/dev/null; then
+          script="$script && echo low-power > $soc/profile"
+        fi
+        # Silent's custom CPU limits ride along in the same prompt. The split
+        # write leaves the legacy platform_profile at "custom", which asusd
+        # answers with profile_custom_epp (Performance): let asusd react first,
+        # then put EPP back to "power" so Silent really is quiet. Both steps are
+        # best effort (a locked RAPL, no EPP files, EBUSY under the performance
+        # governor); success is judged by re-reading the profile below.
+        rs=$(rapl_script_for silent)
+        script="$script && { ${rs:+$rs; }sleep 2; for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do [ -w \"\$f\" ] && echo power > \"\$f\" 2>/dev/null; done; true; }"
+        as_root "$script"; rc=$?
       fi
-      # Silent's custom CPU limits ride along in the same prompt.
-      local rs; rs=$(rapl_script_for silent)
-      [ -n "$rs" ] && script="$script && $rs"
-      # The split write leaves the legacy platform_profile at "custom", which
-      # asusd answers with profile_custom_epp (Performance). Let asusd react
-      # first, then put EPP back to "power" so Silent really is quiet.
-      script="$script && sleep 2 && for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do echo power > \"\$f\"; done"
-      as_root "$script"; local rc=$?
+      # 126: prompt dismissed, 127: not authorized. Anything else is decided
+      # by the profile actually reached, not by the last command's status.
+      if [ "$DRY" = 0 ] && [ $rc != 126 ] && [ $rc != 127 ]; then
+        if [ "$(perf_mode)" = silent ]; then rc=0; else rc=1; fi
+      fi
       if [ $rc != 0 ]; then
         [ -n "$prev" ] && [ "$prev" != power-saver ] && run powerprofilesctl set "$prev"
-        # 126: prompt dismissed, 127: not authorized
         if [ $rc = 126 ] || [ $rc = 127 ]; then echo "Cancelled"; return 3; fi
         echo "Could not switch to Silent"; return 1
       fi
-      [ -n "$rs" ] && [ "$DRY" = 0 ] && rapl_record silent
+      if [ -n "$q" ]; then
+        rapl_apply_for silent   # pkexec only when the limits differ
+      elif [ -n "$rs" ] && [ "$DRY" = 0 ]; then
+        rapl_record silent || echo "Power limits not applied"
+      fi
       ;;
     balanced|turbo)
       local ppd asusp
@@ -457,17 +476,29 @@ cmd_boost() {
 # straight to it). So only the current source's choice is sent now; the other
 # is kept as pending and sent by the watcher right after the next plug/unplug.
 cmd_auto() {
-  local src=${1:-} mode=${2:-} p cur
+  local src=${1:-} mode=${2:-} p cur q=""
   case "$src" in ac|battery) ;; *) echo "usage: auto ac|battery silent|balanced|turbo"; return 2 ;; esac
   case "$mode" in
     balanced) p=Balanced ;; turbo) p=Performance ;;
     silent)
       [ "$src" = battery ] || { echo "Silent is only offered on battery"; return 3; }
-      p=Balanced ;;  # asusd can't hold Silent; the watcher asks for it after unplug
+      # asusd holds Quiet itself when it offers it. Otherwise the battery
+      # profile stays Balanced and the watcher asks for Silent after unplug.
+      q=$(asusd_quiet); p=${q:-Balanced} ;;
     *) echo "usage: auto ac|battery silent|balanced|turbo"; return 2 ;;
   esac
   [ "$(ac_online)" = 1 ] && cur=ac || cur=battery
   [ "$src" = battery ] && { [ "$mode" = silent ] && cfg_set bat_silent 1 || cfg_set bat_silent 0; }
+  if [ "$src" = "$cur" ] && [ "$mode" = silent ] && [ -z "$q" ]; then
+    # Already on battery: setting the battery profile now would apply
+    # Balanced at once and drop out of Silent. Queue it for the next unplug
+    # and go to Silent directly.
+    local b; b=$(asusctl profile get 2>/dev/null | awk '/^Battery profile/ { print $3 }')
+    if [ "$b" = Balanced ]; then cfg_set auto_pending_battery ""; else cfg_set auto_pending_battery Balanced; fi
+    sync_units
+    [ "$(perf_mode)" = silent ] && return 0
+    cmd_perf silent; return
+  fi
   if [ "$src" = "$cur" ]; then
     cfg_set "auto_pending_$src" ""
     local flag; [ "$src" = ac ] && flag=-a || flag=-b
@@ -652,7 +683,8 @@ cmd_status_extra() {
   echo "boost=$(boost_on)"
   echo "gpu_base_tgp=$(rd "$FA/nv_base_tgp/current_value")"
 
-  asusctl profile get 2>/dev/null | awk '/^AC profile/ { print "auto_ac=" tolower($3) } /^Battery profile/ { print "auto_battery=" tolower($3) }' | sed 's/=performance/=turbo/'
+  asusctl profile get 2>/dev/null | awk '/^AC profile/ { print "auto_ac=" tolower($3) } /^Battery profile/ { print "auto_battery=" tolower($3) }' | sed 's/=performance/=turbo/; s/=quiet$/=silent/; s/=lowpower$/=silent/'
+  echo "silent_needs_root=$([ -n "$(asusd_quiet)" ] && echo 0 || echo 1)"
   echo "bat_silent=$(cfg_get bat_silent)"
   echo "auto_pending_ac=$(cfg_get auto_pending_ac)"; echo "auto_pending_battery=$(cfg_get auto_pending_battery)"
 
