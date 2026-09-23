@@ -2,7 +2,7 @@
   "settings": {
     "dry_run": {
       "label": "Dry run",
-      "description": "Show the commands a button would run instead of changing anything"
+      "description": "Show the commands the panel and the background service would run instead of changing anything"
     }
   }
 }
