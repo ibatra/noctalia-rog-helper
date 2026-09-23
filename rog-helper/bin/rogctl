@@ -55,6 +55,10 @@ run() {
   "$@"
 }
 
+# Run an sh snippet as root through polkit (Noctalia's agent shows the prompt).
+# Both binaries by absolute path, so $PATH never decides what runs as root.
+as_root() { run /usr/bin/pkexec /usr/bin/sh -c "$1"; }
+
 rd() { local v; v=$(cat "$1" 2>/dev/null) && printf '%s' "$v" || printf '%s' "${2:-}"; }
 
 # ── small persistent state (opt-in automation flags) ───────────────────────────
@@ -279,7 +283,7 @@ cmd_perf() {
       # asusd answers with profile_custom_epp (Performance). Let asusd react
       # first, then put EPP back to "power" so Silent really is quiet.
       script="$script && sleep 2 && for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do echo power > \"\$f\"; done"
-      run pkexec sh -c "$script"; local rc=$?
+      as_root "$script"; local rc=$?
       if [ $rc != 0 ]; then
         [ -n "$prev" ] && [ "$prev" != power-saver ] && run powerprofilesctl set "$prev"
         # 126: prompt dismissed, 127: not authorized
@@ -360,7 +364,7 @@ rapl_script_for() {
 rapl_apply_for() {
   local s rc
   s=$(rapl_script_for "$1"); [ -n "$s" ] || return 0
-  run pkexec sh -c "$s"; rc=$?
+  as_root "$s"; rc=$?
   if [ $rc != 0 ]; then echo "Power limits not applied"; return 0; fi
   [ "$DRY" = 1 ] && return 0
   sleep 1
@@ -403,7 +407,7 @@ cmd_boost() {
   local f v rc; f=$(boost_file); [ -n "$f" ] || { echo "No boost control"; return 3; }
   case "${1:-}" in on) v=1 ;; off) v=0 ;; *) echo "usage: boost on|off"; return 2 ;; esac
   case "$f" in */no_turbo) v=$((1 - v)) ;; esac
-  run pkexec sh -c "echo $v > $f"; rc=$?
+  as_root "echo $v > $f"; rc=$?
   if [ $rc = 126 ] || [ $rc = 127 ]; then echo "Cancelled"; return 3; fi
   return $rc
 }
