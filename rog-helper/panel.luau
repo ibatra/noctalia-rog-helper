@@ -167,6 +167,8 @@ local function dgpuText()
   return "dGPU"
 end
 
+local function dgpuActive() return dgpuText() == "dGPU active" end
+
 local function batteryGlyph()
   local pct = num(st.battery) or 0
   if st.ac == "1" then return "battery-charging" end
@@ -313,9 +315,14 @@ end
 
 -- ── main view ─────────────────────────────────────────────────────────────────
 
--- The one expressive element: a live trace of battery power, sampled every
--- 10 s by the bar widget, so a dGPU waking up shows as a step you can see.
+-- The one expressive element: a live trace of power draw on battery, sampled
+-- every 10 s by the bar widget, so a dGPU waking up shows as a step you can
+-- see. The battery only measures draw while discharging, so on AC the trace
+-- gives way to a caption of the same height.
 local function drawTrace()
+  if st.battery_status ~= "Discharging" then
+    return ui.column({ height = 30, justify = "center", align = "center" }, { caption("Power draw shows on battery") })
+  end
   local hist = noctalia.state.get("rog.draw") or {}
   local peak = 30
   for _, v in ipairs(hist) do if v > peak then peak = v end end
@@ -326,26 +333,31 @@ local function drawTrace()
   local ceiling = {}
   for i = 1, #vals do ceiling[i] = 1 end
   return ui.graph({ height = 30, values = vals, values2 = ceiling,
-    color = st.dgpu == "active" and "tertiary" or "primary", color2 = "primary/0", lineWidth = 1.5, fillOpacity = 0.14 })
+    color = dgpuActive() and "tertiary" or "primary", color2 = "primary/0", lineWidth = 1.5, fillOpacity = 0.14 })
 end
 
+-- The battery's rate is the machine's draw only while discharging. Charging,
+-- it is the charge rate (shown muted, not as usage); on AC otherwise, nothing.
 local function header()
-  local w = num(st.battery_watts)
-  local charging = st.battery_status == "Charging"
-  local watts = (w and w > 0) and string.format("%.1f W", w) or "0 W"
-  local where = chargerText()
-  local source = where and (charging and `{where}, charging` or where) or "On battery"
+  local w = math.abs(num(st.battery_watts) or 0)
+  local status = st.battery_status
+  local rate = nil
+  if status == "Discharging" then
+    rate = ui.label({ text = string.format("%.1f W", w), fontSize = 13, fontWeight = "medium", color = "primary" })
+  elseif status == "Charging" and w > 0 then
+    rate = ui.label({ text = string.format("Charging +%.0f W", w), fontSize = 11, color = "on_surface_variant" })
+  end
   return ui.column({ gap = 6 }, {
     ui.row({ align = "end", gap = 8 }, {
       ui.label({ text = st.battery and `{st.battery}%` or "", fontSize = 20, fontWeight = "light", color = "on_surface" }),
-      ui.label({ text = source, fontSize = 11, color = "on_surface_variant", flexGrow = 1 }),
-      ui.label({ text = watts, fontSize = 13, fontWeight = "medium", color = "primary" }),
+      ui.label({ text = chargerText() or "On battery", fontSize = 11, color = "on_surface_variant", flexGrow = 1 }),
+      rate,
     }),
     drawTrace(),
     ui.row({ align = "center", gap = 12 }, {
       st.cpu_temp and stat("temperature", `CPU {st.cpu_temp}°`) or ui.spacer({}),
       ui.spacer({ flexGrow = 1 }),
-      stat("device-desktop", dgpuText(), st.dgpu == "active" and "tertiary" or nil),
+      stat("device-desktop", dgpuText(), dgpuActive() and "tertiary" or nil),
     }),
   })
 end

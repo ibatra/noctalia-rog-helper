@@ -14,6 +14,7 @@ local PERF_LABEL = { silent = "Silent", balanced = "Balanced", turbo = "Turbo" }
 
 local asusProfile -- resolved once: the asus-wmi platform-profile handler
 local dgpuPath -- resolved when the dGPU is present
+local batPath -- resolved once: the first BAT* power supply, with a trailing /
 
 local function read(path)
   local s = noctalia.readFile(path)
@@ -40,6 +41,15 @@ local function resolveDgpu()
   return nil
 end
 
+local function resolveBattery()
+  local names = {}
+  for _, e in ipairs(noctalia.listDir("/sys/class/power_supply/") or {}) do
+    if e:match("^BAT") then names[#names + 1] = e end
+  end
+  table.sort(names)
+  return names[1] and ("/sys/class/power_supply/" .. names[1] .. "/") or nil
+end
+
 local function perfMode()
   asusProfile = asusProfile or resolveHandler()
   local p = read(asusProfile)
@@ -52,8 +62,13 @@ end
 local function gpuText()
   if read(FA .. "dgpu_disable/current_value") == "1" then return "Eco, dGPU off" end
   if dgpuPath == nil or not noctalia.fileExists(dgpuPath) then dgpuPath = resolveDgpu() end
-  local rt = dgpuPath and read(dgpuPath .. "/power/runtime_status") or "off"
   local mode = read(FA .. "gpu_mux_mode/current_value") == "0" and "Ultimate" or "Standard"
+  if not dgpuPath then return mode end
+  -- runtime_status only means something with a driver bound
+  if not noctalia.fileExists(dgpuPath .. "/driver") then
+    return read(dgpuPath .. "/power_state") == "D3cold" and (mode .. ", dGPU off") or mode
+  end
+  local rt = read(dgpuPath .. "/power/runtime_status")
   if rt == "active" then return mode .. ", dGPU active" end
   if rt == "suspended" then return mode .. ", dGPU suspended" end
   return mode
@@ -67,7 +82,8 @@ local function render()
     { key = "Performance", value = PERF_LABEL[perf] or "Unknown" },
     { key = "GPU", value = gpuText() },
   }
-  local limit = read("/sys/class/power_supply/BAT1/charge_control_end_threshold")
+  batPath = batPath or resolveBattery()
+  local limit = batPath and read(batPath .. "charge_control_end_threshold")
   if limit then rows[#rows + 1] = { key = "Battery limit", value = limit .. "%" } end
   barWidget.setTooltip(rows)
 end
@@ -76,19 +92,37 @@ noctalia.state.watch("rog.status", function(_value)
   render()
 end)
 
--- Battery power history for the panel's trace: 36 samples, one per tick
--- (10 s), i.e. the last six minutes. Two sysfs reads, no subprocess.
+-- Power draw history for the panel's trace: 36 samples, one per tick (10 s),
+-- i.e. the last six minutes. A few sysfs reads, no subprocess. Only a
+-- discharging battery measures what the machine draws (charging reads the
+-- charge rate, and on AC at the limit it reads about 0), so the trace only
+-- samples then and starts over whenever the battery status changes.
 local HISTORY = 36
 local function sampleDraw()
-  local bat = "/sys/class/power_supply/BAT1/"
-  local p = tonumber(read(bat .. "power_now") or "")
+  batPath = batPath or resolveBattery()
+  if not batPath then return end
+  -- one sample per tick however many bars carry the widget
+  local now = noctalia.nowMs()
+  local last = noctalia.state.get("rog.drawAt")
+  if type(last) == "number" and now - last < 9000 then return end
+  noctalia.state.set("rog.drawAt", now)
+
+  local status = read(batPath .. "status") or ""
+  if noctalia.state.get("rog.drawStatus") ~= status then
+    noctalia.state.set("rog.drawStatus", status)
+    noctalia.state.set("rog.draw", {})
+  end
+  if status ~= "Discharging" then return end
+
+  local p = tonumber(read(batPath .. "power_now") or "")
   if p then
     p = p / 1e6
   else
-    local c, v = tonumber(read(bat .. "current_now") or ""), tonumber(read(bat .. "voltage_now") or "")
+    local c, v = tonumber(read(batPath .. "current_now") or ""), tonumber(read(batPath .. "voltage_now") or "")
     if not (c and v) then return end
     p = c * v / 1e12
   end
+  p = math.abs(p) -- some drivers report discharge as negative
   local hist = noctalia.state.get("rog.draw") or {}
   local copy = {}
   for i = math.max(1, #hist - HISTORY + 2), #hist do copy[#copy + 1] = hist[i] end

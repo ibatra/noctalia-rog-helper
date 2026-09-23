@@ -11,8 +11,9 @@ Not affiliated with G-Helper or ASUS; it drives the same knobs through `asusctl`
 
 ## What's in it
 
-- **Header**: battery %, charger type, power draw with a 6-minute trace, CPU temperature and
-  dGPU state. The trace is useful for spotting the dGPU waking up.
+- **Header**: battery %, charger type, power draw on battery (charge rate while charging), with a
+  6-minute trace, CPU temperature and dGPU state. The trace only samples on battery, where it is
+  useful for spotting the dGPU waking up.
 - **Performance**: Silent / Balanced / Turbo, per power source (plugged in vs battery).
 - **GPU**: Eco / Standard / Optimized (Eco on battery, Standard on AC) / Ultimate (MUX, needs a
   restart).
