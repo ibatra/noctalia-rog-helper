@@ -1,0 +1,8 @@
+{
+  "settings": {
+    "dry_run": {
+      "label": "Dry run",
+      "description": "Show the commands a button would run instead of changing anything"
+    }
+  }
+}

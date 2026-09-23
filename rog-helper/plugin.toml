@@ -1,0 +1,40 @@
+# ROG helper - a G-Helper-style control panel for ASUS ROG laptops.
+#
+# bar   -> glyph for the current performance mode; click opens the panel.
+#          Reads sysfs directly every 10 s (no subprocess, never wakes the dGPU).
+# panel -> Performance / GPU / Screen / Battery limit / Keyboard rows. Every
+#          action goes through bin/rogctl (asusctl, powerprofilesctl, hyprctl).
+#
+# Open it with: noctalia msg panel-toggle ishaan/rog-helper:panel
+
+id = "ishaan/rog-helper"
+name = "ROG helper"
+version = "0.1.0"
+plugin_api = 30
+author = "ishaan"
+license = "MIT"
+dependencies = []
+tags = ["hardware", "asus", "power", "gpu"]
+icon = "device-laptop"
+description = "G-Helper-style performance, GPU, screen, battery and keyboard controls for ASUS ROG laptops."
+
+[[setting]]
+key = "dry_run"
+type = "bool"
+label_key = "settings.dry_run.label"
+description_key = "settings.dry_run.description"
+default = false
+advanced = true
+
+[[widget]]
+id = "bar"
+entry = "widget.luau"
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+width = 340
+height = 432
+placement = "attached"
+position = "auto"
+open_near_click = true

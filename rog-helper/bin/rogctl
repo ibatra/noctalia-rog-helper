@@ -1,0 +1,876 @@
+#!/usr/bin/env bash
+# rogctl - hardware helper behind the ROG helper Noctalia plugin.
+#
+# Everything here runs as the user. asusd accepts D-Bus writes from the
+# wheel/users groups, so asusctl needs no root. The one exception is the
+# Silent profile, which writes the per-handler platform-profile files through
+# pkexec (Noctalia's polkit agent shows the prompt).
+#
+# Never touches nvidia-smi/NVML: dGPU state comes from sysfs runtime PM only.
+#
+#   rogctl [--dry-run] status | status-extra      key=value snapshots
+#   rogctl [--dry-run] perf silent|balanced|turbo  (Silent: pkexec)
+#   rogctl [--dry-run] gpu eco|standard|optimized|ultimate
+#   rogctl [--dry-run] refresh low|max|auto
+#   rogctl [--dry-run] limit <20-100> | oneshot
+#   rogctl [--dry-run] kbd 0|1|2|3
+#   rogctl [--dry-run] rapl set <mode> PL1 PL2 | rapl reset <mode> | rapl-apply   (pkexec)
+#   rogctl [--dry-run] boost on|off                                               (pkexec)
+#   rogctl [--dry-run] auto ac|battery silent|balanced|turbo
+#   rogctl [--dry-run] fan balanced|turbo default|quiet|cool
+#   rogctl [--dry-run] aura static|breathe|pulse|cycle|wave [RRGGBB] [RRGGBB] [low|med|high]
+#   rogctl [--dry-run] aura-power <boot> <awake> <sleep> <shutdown>   (0/1 each)
+#   rogctl [--dry-run] slash on|off|mode <m>|brightness N|interval N|battery on|off|warning on|off
+#   rogctl [--dry-run] boot-sound on|off
+#   rogctl login-hook                             (rog-helper-login.service)
+#   rogctl watch                                  (rog-helper-auto.service)
+#
+# Dry run: --dry-run, ROG_DRY_RUN=1, or touch ~/.config/rog-helper/dry-run.
+# Exit codes: 0 ok, 2 bad usage, 3 blocked (message on stdout), 1 failed.
+
+set -u
+
+DRY=0
+if [ "${1:-}" = "--dry-run" ]; then DRY=1; shift; fi
+[ -n "${ROG_DRY_RUN:-}" ] && DRY=1
+[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/rog-helper/dry-run" ] && DRY=1
+
+SELF=$(readlink -f "$0")
+exec 9>&2   # dry-run notes go here even when a command's output is silenced
+FA=/sys/class/firmware-attributes/asus-armoury/attributes
+CONF_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/rog-helper
+STATE_FILE=$CONF_DIR/state
+UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+AUTO_UNIT=rog-helper-auto.service
+LOGIN_UNIT=rog-helper-login.service
+
+log() { printf '%s\n' "$*" >&2; }
+
+# Run a mutating command, or just describe it in dry-run mode.
+run() {
+  if [ "$DRY" = 1 ]; then
+    printf 'dry-run: %s\n' "$*" >&9
+    return 0
+  fi
+  "$@"
+}
+
+rd() { local v; v=$(cat "$1" 2>/dev/null) && printf '%s' "$v" || printf '%s' "${2:-}"; }
+
+# ── small persistent state (opt-in automation flags) ───────────────────────────
+
+cfg_get() { [ -f "$STATE_FILE" ] && sed -n "s/^$1=//p" "$STATE_FILE" | tail -n1; }
+cfg_set() {
+  [ "$(cfg_get "$1")" = "$2" ] && return 0
+  [ "$DRY" = 1 ] && { printf 'dry-run: set %s=%s in %s\n' "$1" "$2" "$STATE_FILE" >&9; return 0; }
+  mkdir -p "$CONF_DIR"
+  local tmp; tmp=$(mktemp "$CONF_DIR/.state.XXXXXX")
+  { [ -f "$STATE_FILE" ] && grep -v "^$1=" "$STATE_FILE"; printf '%s=%s\n' "$1" "$2"; } >"$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+# ── hardware discovery ─────────────────────────────────────────────────────────
+
+ac_online() {
+  local f
+  for f in /sys/class/power_supply/A*/online /sys/class/power_supply/*/online; do
+    [ -f "$f" ] || continue
+    [ "$(rd "${f%/online}/type")" = "Mains" ] || continue
+    rd "$f" 0; return
+  done
+  echo 0
+}
+
+# PCI path of the NVIDIA dGPU, empty when it is powered off (dgpu_disable=1).
+dgpu_dev() {
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [ "$(rd "$d/vendor")" = "0x10de" ] || continue
+    case "$(rd "$d/class")" in 0x03*) echo "$d"; return ;; esac
+  done
+}
+
+# platform-profile handler dir by driver name ("asus-wmi"); "other" = first non-asus one.
+pp_handler() {
+  local d n
+  for d in /sys/class/platform-profile/*; do
+    [ -f "$d/name" ] || continue
+    n=$(rd "$d/name")
+    if [ "$1" = other ]; then
+      [ "$n" != "asus-wmi" ] && { echo "$d"; return; }
+    elif [ "$n" = "$1" ]; then
+      echo "$d"; return
+    fi
+  done
+}
+
+perf_mode() {
+  local h p
+  h=$(pp_handler asus-wmi)
+  if [ -n "$h" ]; then p=$(rd "$h/profile"); else p=$(rd /sys/firmware/acpi/platform_profile); fi
+  case "$p" in
+    quiet|low-power) echo silent ;;
+    balanced) echo balanced ;;
+    performance) echo turbo ;;
+    *) echo unknown ;;
+  esac
+}
+
+# The eDP output Hyprland is driving and whether it hangs off the NVIDIA card
+# (i.e. the MUX is really in dGPU mode for this boot).
+active_edp() {
+  command -v hyprctl >/dev/null || return
+  hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.name|startswith("eDP")) | "\(.name) \(.width)x\(.height) \(.refreshRate) \(.scale) \(.x)x\(.y) \([.availableModes[]] | join(","))"' 2>/dev/null | head -n1
+}
+
+edp_on_nvidia() {
+  local name=$1 c
+  for c in /sys/class/drm/card*-"$name"; do
+    [ -e "$c" ] || continue
+    case "$(readlink -f "${c%-"$name"}/device/driver")" in */nvidia|*/nouveau) echo 1; return ;; esac
+  done
+  echo 0
+}
+
+# Processes of this user holding the dGPU device nodes (fuser scans /proc; it
+# does not touch the GPU).
+dgpu_holders() {
+  local dev nodes=() n
+  dev=$(dgpu_dev)
+  [ -n "$dev" ] || return
+  for n in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-modeset; do [ -e "$n" ] && nodes+=("$n"); done
+  if [ -d "$dev/drm" ]; then
+    for n in "$dev"/drm/card* "$dev"/drm/renderD*; do [ -e "$n" ] && nodes+=("/dev/dri/${n##*/}"); done
+  fi
+  [ ${#nodes[@]} -gt 0 ] || return
+  fuser "${nodes[@]}" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+' | sed 's/[^0-9]//g' | sort -u |
+    while read -r pid; do rd "/proc/$pid/comm"; echo; done | sort -u | paste -sd, - | sed 's/,/, /g'
+}
+
+# ── status ─────────────────────────────────────────────────────────────────────
+
+cmd_status() {
+  local dev rt dis mux pend edp name res rate scale pos modes on_nv max
+  echo "perf=$(perf_mode)"
+  local h; h=$(pp_handler asus-wmi); echo "perf_asus=$( [ -n "$h" ] && rd "$h/profile")"
+  h=$(pp_handler other); echo "perf_soc=$( [ -n "$h" ] && rd "$h/profile")"
+  echo "perf_legacy=$(rd /sys/firmware/acpi/platform_profile)"
+  echo "ac=$(ac_online)"
+  # asus-armoury charge_mode: 0 none (battery), 1 barrel adapter, 2 USB-C
+  echo "charge_mode=$(rd "$FA/charge_mode/current_value")"
+  echo "epp=$(rd /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference)"
+
+  dev=$(dgpu_dev)
+  if [ -n "$dev" ]; then rt=$(rd "$dev/power/runtime_status" unknown); else rt=off; fi
+  dis=$(rd "$FA/dgpu_disable/current_value")
+  mux=$(rd "$FA/gpu_mux_mode/current_value")
+  pend=$(rd "$FA/pending_reboot/current_value" 0)
+  echo "dgpu=$rt"
+  echo "dgpu_disable=$dis"
+  echo "mux=$mux"
+  echo "pending_reboot=$pend"
+
+  edp=$(active_edp)
+  if [ -n "$edp" ]; then
+    read -r name res rate scale pos modes <<<"$edp"
+    on_nv=$(edp_on_nvidia "$name")
+    max=$(tr ',' '\n' <<<"$modes" | grep "^$res@" | sed 's/.*@\([0-9.]*\)Hz/\1/' | sort -n | tail -n1)
+    echo "monitor=$name"
+    echo "resolution=$res"
+    echo "refresh=$(printf '%.0f' "$rate")"
+    echo "refresh_max=$(printf '%.0f' "${max:-$rate}")"
+    echo "refresh_low=$(tr ',' '\n' <<<"$modes" | grep "^$res@" | sed 's/.*@\([0-9.]*\)Hz/\1/' | sort -n | head -n1 | xargs printf '%.0f')"
+    echo "scale=$scale"
+    echo "position=$pos"
+    echo "booted_ultimate=$on_nv"
+  else
+    echo "booted_ultimate=$([ "$mux" = 0 ] && [ "$pend" != 1 ] && echo 1 || echo 0)"
+  fi
+
+  echo "optimized=$(cfg_get optimized)"
+  echo "screen_auto=$(cfg_get screen_auto)"
+  echo "pending_gpu=$(cfg_get pending_gpu)"
+
+  echo "kbd=$(rd /sys/class/leds/asus::kbd_backlight/brightness)"
+  echo "kbd_max=$(rd /sys/class/leds/asus::kbd_backlight/max_brightness 3)"
+
+  local bat; bat=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -n1)
+  if [ -n "$bat" ]; then
+    echo "limit=$(rd "$bat/charge_control_end_threshold")"
+    echo "battery=$(rd "$bat/capacity")"
+    echo "battery_status=$(rd "$bat/status")"
+    local cur vol pw
+    cur=$(rd "$bat/current_now" 0); vol=$(rd "$bat/voltage_now" 0); pw=$(rd "$bat/power_now" "")
+    if [ -n "$pw" ]; then echo "battery_watts=$(awk -v p="$pw" 'BEGIN{printf "%.1f", p/1e6}')"
+    else echo "battery_watts=$(awk -v c="$cur" -v v="$vol" 'BEGIN{printf "%.1f", (c*v)/1e12}')"; fi
+  fi
+
+  local hw
+  for hw in /sys/class/hwmon/hwmon*; do
+    case "$(rd "$hw/name")" in
+      asus)
+        local i
+        for i in 1 2 3; do
+          [ -f "$hw/fan${i}_input" ] || continue
+          case "$(rd "$hw/fan${i}_label")" in
+            cpu_fan) echo "fan_cpu=$(rd "$hw/fan${i}_input")" ;;
+            gpu_fan) echo "fan_gpu=$(rd "$hw/fan${i}_input")" ;;
+            mid_fan) echo "fan_mid=$(rd "$hw/fan${i}_input")" ;;
+          esac
+        done ;;
+      coretemp|k10temp|zenpower)
+        echo "cpu_temp=$(( $(rd "$hw/temp1_input" 0) / 1000 ))" ;;
+    esac
+  done
+}
+
+# ── performance ────────────────────────────────────────────────────────────────
+
+cmd_perf() {
+  local src; [ "$(ac_online)" = 1 ] && src=-a || src=-b
+  case "${1:-}" in
+    silent)
+      local asus soc script
+      asus=$(pp_handler asus-wmi)
+      soc=$(pp_handler other)
+      [ -n "$asus" ] || { echo "No asus-wmi platform profile"; return 1; }
+      local prev=""
+      if command -v powerprofilesctl >/dev/null; then
+        prev=$(powerprofilesctl get 2>/dev/null)
+        run powerprofilesctl set power-saver
+      fi
+      script="echo quiet > $asus/profile"
+      if [ -n "$soc" ] && grep -qw low-power "$soc/choices" 2>/dev/null; then
+        script="$script && echo low-power > $soc/profile"
+      fi
+      # Silent's custom CPU limits ride along in the same prompt.
+      local rs; rs=$(rapl_script_for silent)
+      [ -n "$rs" ] && script="$script && $rs"
+      # The split write leaves the legacy platform_profile at "custom", which
+      # asusd answers with profile_custom_epp (Performance). Let asusd react
+      # first, then put EPP back to "power" so Silent really is quiet.
+      script="$script && sleep 2 && for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do echo power > \"\$f\"; done"
+      run pkexec sh -c "$script"; local rc=$?
+      if [ $rc != 0 ]; then
+        [ -n "$prev" ] && [ "$prev" != power-saver ] && run powerprofilesctl set "$prev"
+        # 126: prompt dismissed, 127: not authorized
+        if [ $rc = 126 ] || [ $rc = 127 ]; then echo "Cancelled"; return 3; fi
+        echo "Could not switch to Silent"; return 1
+      fi
+      ;;
+    balanced|turbo)
+      local ppd asusp
+      [ "$1" = balanced ] && { ppd=balanced; asusp=Balanced; } || { ppd=performance; asusp=Performance; }
+      command -v powerprofilesctl >/dev/null && run powerprofilesctl set "$ppd"
+      run asusctl profile set "$src" "$asusp" >/dev/null || return 1
+      if [ "$DRY" = 0 ] && [ "$(perf_mode)" = silent ]; then
+        # asusd skips the write when it already believes it is in this profile
+        # and ppd may not have written either: go through the other profile.
+        local other; [ "$asusp" = Balanced ] && other=Performance || other=Balanced
+        asusctl profile set "$src" "$other" >/dev/null; asusctl profile set "$src" "$asusp" >/dev/null
+        [ "$(perf_mode)" = silent ] && { echo "Still in Silent"; return 1; }
+      fi
+      rapl_apply_for "$1"
+      ;;
+    *) echo "usage: perf silent|balanced|turbo"; return 2 ;;
+  esac
+}
+
+# ── CPU power limits (Intel RAPL; asus-armoury ppt_* is not readable here) ─────
+#
+# Limits are caps: the lower of RAPL and the firmware's own budget wins. Per-mode
+# custom values live in the state file as pl_<mode>=PL1,PL2 (watts). The BIOS
+# values seen before we ever wrote anything are kept as rapl_default_pl1/2 and
+# are also the ceiling, so a custom limit can only ever lower power.
+
+rapl_dirs() {
+  local d
+  for d in /sys/class/powercap/intel-rapl:0 /sys/class/powercap/intel-rapl-mmio:0; do
+    [ "$(rd "$d/name")" = package-0 ] && [ -f "$d/constraint_1_power_limit_uw" ] && echo "$d"
+  done
+}
+
+rapl_w() {  # effective (lowest) limit of constraint $1 in watts
+  local d v min=""
+  for d in $(rapl_dirs); do
+    v=$(rd "$d/constraint_$1_power_limit_uw" 0)
+    if [ -z "$min" ] || [ "$v" -lt "$min" ]; then min=$v; fi
+  done
+  echo $(( ${min:-0} / 1000000 ))
+}
+
+rapl_defaults() {
+  local d1 d2
+  d1=$(cfg_get rapl_default_pl1); d2=$(cfg_get rapl_default_pl2)
+  if [ -z "$d1" ] || [ -z "$d2" ]; then
+    d1=$(rapl_w 0); d2=$(rapl_w 1)
+    if [ -z "$(cfg_get pl_silent)$(cfg_get pl_balanced)$(cfg_get pl_turbo)" ] && [ "$d1" -gt 0 ]; then
+      cfg_set rapl_default_pl1 "$d1"; cfg_set rapl_default_pl2 "$d2"
+    fi
+  fi
+  echo "$d1 $d2"
+}
+
+rapl_target() {  # "PL1 PL2" wanted for mode $1
+  local c; c=$(cfg_get "pl_$1")
+  if [ -n "$c" ]; then echo "${c%,*} ${c#*,}"; else rapl_defaults; fi
+}
+
+# sh snippet that sets mode $1's limits, empty when they are already in place
+rapl_script_for() {
+  local t p1 p2 d s=""
+  [ -n "$(rapl_dirs)" ] || return 0
+  t=$(rapl_target "$1"); p1=${t% *}; p2=${t#* }
+  [ "$(rapl_w 0)" = "$p1" ] && [ "$(rapl_w 1)" = "$p2" ] && return 0
+  for d in $(rapl_dirs); do
+    s="${s:+$s && }echo $((p1 * 1000000)) > $d/constraint_0_power_limit_uw && echo $((p2 * 1000000)) > $d/constraint_1_power_limit_uw"
+  done
+  echo "$s"
+}
+
+rapl_apply_for() {
+  local s rc
+  s=$(rapl_script_for "$1"); [ -n "$s" ] || return 0
+  run pkexec sh -c "$s"; rc=$?
+  if [ $rc != 0 ]; then echo "Power limits not applied"; return 0; fi
+  [ "$DRY" = 1 ] && return 0
+  sleep 1
+  [ -z "$(rapl_script_for "$1")" ] || echo "Firmware kept its own power limits"
+}
+
+cmd_rapl() {
+  local mode=${2:-} d p1 p2
+  case "$mode" in silent|balanced|turbo) ;; *) echo "usage: rapl set|reset <mode> [PL1 PL2]"; return 2 ;; esac
+  d=$(rapl_defaults)
+  case "${1:-}" in
+    set)
+      p1=${3:-}; p2=${4:-}
+      [[ "$p1" =~ ^[0-9]+$ && "$p2" =~ ^[0-9]+$ ]] || { echo "usage: rapl set <mode> PL1 PL2"; return 2; }
+      [ "$p1" -ge 10 ] || { echo "Sustained limit must be at least 10 W"; return 3; }
+      [ "$p2" -ge "$p1" ] || { echo "Boost limit must be at least the sustained limit"; return 3; }
+      [ "$p1" -le "${d% *}" ] && [ "$p2" -le "${d#* }" ] || { echo "Above the firmware default"; return 3; }
+      if [ "$p1" = "${d% *}" ] && [ "$p2" = "${d#* }" ]; then cfg_set "pl_$mode" ""; else cfg_set "pl_$mode" "$p1,$p2"; fi ;;
+    reset) cfg_set "pl_$mode" "" ;;
+    *) echo "usage: rapl set|reset <mode> [PL1 PL2]"; return 2 ;;
+  esac
+  sync_units
+  [ "$(perf_mode)" = "$mode" ] && rapl_apply_for "$mode"
+  return 0
+}
+
+# ── CPU boost (intel_pstate turbo) ─────────────────────────────────────────────
+
+boost_file() {
+  if [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]; then echo /sys/devices/system/cpu/intel_pstate/no_turbo
+  elif [ -f /sys/devices/system/cpu/cpufreq/boost ]; then echo /sys/devices/system/cpu/cpufreq/boost; fi
+}
+
+boost_on() {
+  local f; f=$(boost_file); [ -n "$f" ] || { echo 1; return; }
+  case "$f" in */no_turbo) [ "$(rd "$f")" = 0 ] && echo 1 || echo 0 ;; *) rd "$f" 1 ;; esac
+}
+
+cmd_boost() {
+  local f v rc; f=$(boost_file); [ -n "$f" ] || { echo "No boost control"; return 3; }
+  case "${1:-}" in on) v=1 ;; off) v=0 ;; *) echo "usage: boost on|off"; return 2 ;; esac
+  case "$f" in */no_turbo) v=$((1 - v)) ;; esac
+  run pkexec sh -c "echo $v > $f"; rc=$?
+  if [ $rc = 126 ] || [ $rc = 127 ]; then echo "Cancelled"; return 3; fi
+  return $rc
+}
+
+# ── per power source profile (asusd switches on plug/unplug) ───────────────────
+
+# asusd 6.5 applies a per-source profile the moment it is set, even when that
+# power source is not the current one (setting the AC profile on battery jumps
+# straight to it). So only the current source's choice is sent now; the other
+# is kept as pending and sent by the watcher right after the next plug/unplug.
+cmd_auto() {
+  local src=${1:-} mode=${2:-} p cur
+  case "$src" in ac|battery) ;; *) echo "usage: auto ac|battery silent|balanced|turbo"; return 2 ;; esac
+  case "$mode" in
+    balanced) p=Balanced ;; turbo) p=Performance ;;
+    silent)
+      [ "$src" = battery ] || { echo "Silent is only offered on battery"; return 3; }
+      p=Balanced ;;  # asusd can't hold Silent; the watcher asks for it after unplug
+    *) echo "usage: auto ac|battery silent|balanced|turbo"; return 2 ;;
+  esac
+  [ "$(ac_online)" = 1 ] && cur=ac || cur=battery
+  [ "$src" = battery ] && { [ "$mode" = silent ] && cfg_set bat_silent 1 || cfg_set bat_silent 0; }
+  if [ "$src" = "$cur" ]; then
+    cfg_set "auto_pending_$src" ""
+    local flag; [ "$src" = ac ] && flag=-a || flag=-b
+    run asusctl profile set "$flag" "$p" >/dev/null || return 1
+  else
+    cfg_set "auto_pending_$src" "$p"
+  fi
+  sync_units
+}
+
+auto_flush_pending() {  # called by the watcher after a power change
+  local src flag p
+  [ "$(ac_online)" = 1 ] && { src=ac; flag=-a; } || { src=battery; flag=-b; }
+  p=$(cfg_get "auto_pending_$src"); [ -n "$p" ] || return 0
+  run asusctl profile set "$flag" "$p" >/dev/null && cfg_set "auto_pending_$src" ""
+}
+
+# ── fan curves (asusd, per profile) ────────────────────────────────────────────
+
+# "CPU temps pwms enabled" lines for profile $1 (balanced|performance)
+fan_curves() {
+  asusctl fan-curve --mod-profile "$1" 2>/dev/null | awk '
+    /fan:/ { f=$2; gsub(/[ ,]/, "", f) }
+    /pwm:/ { p=$0; sub(/.*\(/, "", p); sub(/\).*/, "", p); gsub(/ /, "", p) }
+    /temp:/ { t=$0; sub(/.*\(/, "", t); sub(/\).*/, "", t); gsub(/ /, "", t) }
+    /enabled:/ { e=$2; gsub(/[ ,]/, "", e); print f, t, p, e }'
+}
+
+# Firmware default curve for profile/fan, captured while asusd still reports the
+# stock curve (enabled=false) and kept in the state file afterwards.
+fan_default() {  # $1 profile $2 CPU|GPU -> "temps pwms"
+  local key="fan_default_$1_$2" v line
+  v=$(cfg_get "$key")
+  if [ -z "$v" ]; then
+    line=$(fan_curves "$1" | awk -v f="$2" '$1 == f && $4 == "false" { print $2 ";" $3 }')
+    [ -n "$line" ] && { v=$line; [ "$DRY" = 1 ] || cfg_set "$key" "$v"; }
+  fi
+  echo "$v"
+}
+
+# Build a preset from the default curve. Never quieter than stock at >= 70 C.
+fan_preset() {  # $1 profile $2 fan $3 default|quiet|cool -> "temps;pwms"
+  local d; d=$(fan_default "$1" "$2"); [ -n "$d" ] || return 1
+  awk -v d="$d" -v preset="$3" 'BEGIN {
+    split(d, parts, ";"); n = split(parts[1], t, ","); split(parts[2], p, ",")
+    prev = 0; out_t = ""; out_p = ""
+    for (i = 1; i <= n; i++) {
+      v = p[i]
+      if (preset == "quiet") { if (t[i] < 60) v = p[i] * 0.7; else if (t[i] < 70) v = p[i] * 0.85 }
+      if (preset == "cool") { v = p[i] * 1.25 + 8 }
+      v = int(v + 0.5); if (v > 255) v = 255; if (v < prev) v = prev; prev = v
+      out_t = out_t (i > 1 ? "," : "") t[i]; out_p = out_p (i > 1 ? "," : "") v
+    }
+    print out_t ";" out_p }'
+}
+
+# Refuse curves that could cook the machine.
+fan_valid() {  # $1 "temps;pwms" $2 default "temps;pwms"
+  awk -v c="$1" -v d="$2" 'BEGIN {
+    split(c, a, ";"); n = split(a[1], t, ","); split(a[2], p, ",")
+    split(d, b, ";"); split(b[2], dp, ",")
+    if (n != 8) exit 1
+    for (i = 1; i <= n; i++) {
+      if (i > 1 && (t[i] + 0 <= t[i-1] + 0 || p[i] + 0 < p[i-1] + 0)) exit 1
+      if (p[i] + 0 < 0 || p[i] + 0 > 255) exit 1
+      if (t[i] + 0 >= 70 && p[i] + 0 < dp[i] + 0) exit 1
+    }
+    if (p[n] + 0 < 77) exit 1
+  }'
+}
+
+fan_data() {  # "temps;pwms" -> asusctl --data "0c:2,55c:12,..."
+  awk -v c="$1" 'BEGIN { split(c, a, ";"); n = split(a[1], t, ","); split(a[2], p, ",")
+    for (i = 1; i <= n; i++) printf "%s%sc:%s", (i > 1 ? "," : ""), t[i], p[i]; print "" }'
+}
+
+cmd_fan() {
+  local prof=${1:-} preset=${2:-} fan c d
+  case "$prof" in balanced|performance) ;; turbo) prof=performance ;; *) echo "Fan curves exist for Balanced and Turbo only"; return 3 ;; esac
+  case "$preset" in default|quiet|cool|reapply) ;; *) echo "usage: fan balanced|turbo default|quiet|cool"; return 2 ;; esac
+  for fan in CPU GPU; do [ -n "$(fan_default "$prof" "$fan")" ] || { echo "No stock curve recorded"; return 1; }; done
+  if [ "$preset" = default ]; then
+    run asusctl fan-curve --mod-profile "$prof" --enable-fan-curves false >/dev/null || return 1
+    cfg_set "fan_$prof" ""
+    return 0
+  fi
+  if [ "$preset" = reapply ]; then  # re-send the curve asusd already holds (testing)
+    local line
+    while read -r fan t p e; do
+      run asusctl fan-curve --mod-profile "$prof" --fan "${fan,,}" --data "$(fan_data "$t;$p")" >/dev/null || return 1
+    done < <(fan_curves "$prof")
+    return 0
+  fi
+  for fan in CPU GPU; do
+    d=$(fan_default "$prof" "$fan"); c=$(fan_preset "$prof" "$fan" "$preset")
+    fan_valid "$c" "$d" || { echo "Rejected an unsafe $fan curve"; return 1; }
+  done
+  for fan in CPU GPU; do
+    c=$(fan_preset "$prof" "$fan" "$preset")
+    run asusctl fan-curve --mod-profile "$prof" --fan "${fan,,}" --data "$(fan_data "$c")" >/dev/null || return 1
+  done
+  run asusctl fan-curve --mod-profile "$prof" --enable-fan-curves true >/dev/null || return 1
+  cfg_set "fan_$prof" "$preset"
+}
+
+# ── lighting ───────────────────────────────────────────────────────────────────
+
+AURA_RON=$(ls /etc/asusd/aura_*.ron 2>/dev/null | head -n1)
+
+aura_state() {  # "mode colour1 colour2 speed direction" for the current mode
+  [ -n "$AURA_RON" ] || return
+  awk '
+    /current_mode:/ { m=$2; gsub(/,/, "", m) }
+    /^        [A-Za-z]+: \(/ { b=$1; gsub(/:/, "", b) }
+    /colour1:/ { c=1; next } /colour2:/ { c=2; next }
+    c && /r:/ { r=$2+0 } c && /g:/ { g=$2+0 }
+    c && /b:/ { col[b, c]=sprintf("%02x%02x%02x", r, g, $2+0); c=0 }
+    /speed:/ { sp[b]=$2; gsub(/,/, "", sp[b]) } /direction:/ { dir[b]=$2; gsub(/,/, "", dir[b]) }
+    END { print m, col[m, 1], col[m, 2], tolower(sp[m]), tolower(dir[m]) }' "$AURA_RON"
+}
+
+cmd_aura() {  # rogctl aura <mode> [colour1] [colour2] [speed] [direction]
+  local mode=${1:-} c1=${2:-} c2=${3:-} sp=${4:-} dir=${5:-} cur
+  read -r _ cc1 cc2 csp cdir <<<"$(aura_state)"
+  c1=${c1:-${cc1:-ffffff}}; c2=${c2:-${cc2:-000000}}; sp=${sp:-${csp:-med}}; dir=${dir:-${cdir:-right}}
+  [[ "$c1" =~ ^[0-9a-fA-F]{6}$ && "$c2" =~ ^[0-9a-fA-F]{6}$ ]] || { echo "Colours are RRGGBB"; return 2; }
+  case "$sp" in low|med|high) ;; *) sp=med ;; esac
+  case "$dir" in up|down|left|right) ;; *) dir=right ;; esac
+  case "$mode" in
+    static) run asusctl aura effect static -c "$c1" ;;
+    breathe) run asusctl aura effect breathe --colour "$c1" --colour2 "$c2" --speed "$sp" ;;
+    pulse) run asusctl aura effect pulse -c "$c1" ;;
+    cycle) run asusctl aura effect rainbow-cycle --speed "$sp" ;;
+    wave) run asusctl aura effect rainbow-wave --direction "$dir" --speed "$sp" ;;
+    *) echo "usage: aura static|breathe|pulse|cycle|wave [RRGGBB] [RRGGBB] [low|med|high] [dir]"; return 2 ;;
+  esac >/dev/null
+}
+
+cmd_slash() {
+  local b; [ "${2:-}" = on ] && b=true || b=false
+  case "${1:-}" in
+    on) run asusctl slash set --enable ;;
+    off) run asusctl slash set --disable ;;
+    mode) [ -n "${2:-}" ] || return 2; run asusctl slash set --mode "$2" ;;
+    brightness) [[ "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -le 255 ] || return 2; run asusctl slash set -l "$2" ;;
+    interval) [[ "${2:-}" =~ ^[0-5]$ ]] || return 2; run asusctl slash set --interval "$2" ;;
+    battery) run asusctl slash set -b "$b" ;;
+    warning) run asusctl slash set -w "$b" ;;
+    *) echo "usage: slash on|off|mode <m>|brightness 0-255|interval 0-5|battery on|off|warning on|off"; return 2 ;;
+  esac >/dev/null
+}
+
+# Keyboard zone power states (the only aura zone this model reports).
+aura_power_state() {  # "boot awake sleep shutdown" as 0/1
+  [ -n "$AURA_RON" ] || return
+  awk '/zone: Keyboard/ { k=1 } k && /boot:/ { b=($2 ~ /true/) } k && /awake:/ { a=($2 ~ /true/) }
+       k && /sleep:/ { s=($2 ~ /true/) } k && /shutdown:/ { d=($2 ~ /true/); print b, a, s, d; exit }' "$AURA_RON"
+}
+
+cmd_aura_power() {  # rogctl aura-power <boot> <awake> <sleep> <shutdown>  (0/1 each)
+  local args=() names=(boot awake sleep shutdown) i v
+  for i in 0 1 2 3; do
+    v=${*:i+1:1}; [[ "$v" =~ ^[01]$ ]] || { echo "usage: aura-power B A S D (0/1)"; return 2; }
+    [ "$v" = 1 ] && args+=("--${names[i]}")
+  done
+  run asusctl aura power keyboard "${args[@]}" >/dev/null
+}
+
+cmd_boot_sound() {
+  case "${1:-}" in on) run asusctl armoury set boot_sound 1 ;; off) run asusctl armoury set boot_sound 0 ;; *) return 2 ;; esac >/dev/null 2>&1
+}
+
+# ── extra status for the Power / Fans / Lighting views ─────────────────────────
+
+cmd_status_extra() {
+  local d; d=$(rapl_defaults)
+  echo "pl1=$(rapl_w 0)"; echo "pl2=$(rapl_w 1)"
+  echo "pl1_default=${d% *}"; echo "pl2_default=${d#* }"
+  echo "cpu_base_power=$(( $(rd /sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw 0) / 1000000 ))"
+  local m; for m in silent balanced turbo; do echo "pl_$m=$(cfg_get "pl_$m")"; done
+  echo "boost=$(boost_on)"
+  echo "gpu_base_tgp=$(rd "$FA/nv_base_tgp/current_value")"
+
+  asusctl profile get 2>/dev/null | awk '/^AC profile/ { print "auto_ac=" tolower($3) } /^Battery profile/ { print "auto_battery=" tolower($3) }' | sed 's/=performance/=turbo/'
+  echo "bat_silent=$(cfg_get bat_silent)"
+  echo "auto_pending_ac=$(cfg_get auto_pending_ac)"; echo "auto_pending_battery=$(cfg_get auto_pending_battery)"
+
+  local prof fan t p e
+  for prof in balanced performance; do
+    echo "fan_$prof=$(cfg_get "fan_$prof")"
+    while read -r fan t p e; do
+      echo "curve_${prof}_${fan,,}=$t;$p;$e"
+    done < <(fan_curves "$prof")
+    for fan in CPU GPU; do echo "stock_${prof}_${fan,,}=$(fan_default "$prof" "$fan")"; done
+  done
+
+  local am ac1 ac2 asp adir; read -r am ac1 ac2 asp adir <<<"$(aura_state)"
+  echo "aura_mode=$am"; echo "aura_colour=$ac1"; echo "aura_colour2=$ac2"; echo "aura_speed=$asp"; echo "aura_direction=$adir"
+  asusctl slash get 2>/dev/null | awk -F': ' '/^Slash LED/ { print "slash=" ($2 == "enabled" ? 1 : 0) } /^Brightness/ { print "slash_brightness=" $2 }
+    /^Mode/ { print "slash_mode=" $2 } /^Interval/ { print "slash_interval=" $2 }
+    /^Show on battery:/ { print "slash_battery=" ($2 == "true" ? 1 : 0) } /^Show battery warning/ { print "slash_warning=" ($2 == "true" ? 1 : 0) }'
+  local ap; ap=$(aura_power_state); [ -n "$ap" ] && echo "aura_power=${ap// /,}"
+  echo "boot_sound=$(rd "$FA/boot_sound/current_value")"
+  echo "slash_modes=$(asusctl slash list 2>/dev/null | paste -sd, -)"
+
+  local bat; bat=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -n1)
+  if [ -n "$bat" ]; then
+    local full design; full=$(rd "$bat/charge_full" "$(rd "$bat/energy_full" 0)"); design=$(rd "$bat/charge_full_design" "$(rd "$bat/energy_full_design" 0)")
+    [ "$design" -gt 0 ] 2>/dev/null && echo "battery_health=$(( full * 100 / design ))"
+    echo "battery_cycles=$(rd "$bat/cycle_count")"
+  fi
+}
+
+# ── automation units (only installed when a mode that needs them is picked) ────
+
+write_units() {
+  [ "$DRY" = 1 ] && { echo "dry-run: write $UNIT_DIR/{$AUTO_UNIT,$LOGIN_UNIT}" >&9; return 0; }
+  mkdir -p "$UNIT_DIR"
+  cat >"$UNIT_DIR/$AUTO_UNIT" <<EOF
+# Installed by the ROG helper Noctalia plugin. Follows AC power for the
+# Optimized GPU mode and Auto refresh rate. Remove by picking another mode.
+[Unit]
+Description=ROG helper: follow AC power (GPU Optimized, screen Auto)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=$SELF watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+  cat >"$UNIT_DIR/$LOGIN_UNIT" <<EOF
+# Installed by the ROG helper Noctalia plugin. Applies a pending Eco switch (or
+# the Optimized rule) before the compositor opens the dGPU.
+[Unit]
+Description=ROG helper: apply GPU mode before the session starts
+Before=graphical-session-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=$SELF login-hook
+
+[Install]
+WantedBy=graphical-session-pre.target
+EOF
+  systemctl --user daemon-reload
+}
+
+sync_units() {
+  local opt auto pend
+  opt=$(cfg_get optimized); auto=$(cfg_get screen_auto); pend=$(cfg_get pending_gpu)
+  # the power-source watcher is also needed for Silent-on-battery and for
+  # re-applying custom CPU limits after asusd switches profile on plug/unplug
+  if [ "$(cfg_get bat_silent)" = 1 ] || [ -n "$(cfg_get pl_silent)$(cfg_get pl_balanced)$(cfg_get pl_turbo)$(cfg_get auto_pending_ac)$(cfg_get auto_pending_battery)" ]; then auto=1; fi
+  if [ "$opt" = 1 ] || [ "$auto" = 1 ] || [ -n "$pend" ]; then
+    [ -f "$UNIT_DIR/$AUTO_UNIT" ] && [ -f "$UNIT_DIR/$LOGIN_UNIT" ] || write_units
+  fi
+  if [ "$opt" = 1 ] || [ -n "$pend" ]; then
+    run systemctl --user enable -q "$LOGIN_UNIT"
+  elif [ -f "$UNIT_DIR/$LOGIN_UNIT" ]; then
+    run systemctl --user disable -q "$LOGIN_UNIT"
+  fi
+  if [ "$opt" = 1 ] || [ "$auto" = 1 ]; then
+    run systemctl --user enable -q "$AUTO_UNIT"
+    # restart so the watcher re-reads the flags right away
+    run systemctl --user --no-block restart "$AUTO_UNIT"
+  elif [ -f "$UNIT_DIR/$AUTO_UNIT" ]; then
+    run systemctl --user --no-block disable -q --now "$AUTO_UNIT"
+  fi
+}
+
+# ── GPU ────────────────────────────────────────────────────────────────────────
+
+booted_ultimate() {
+  local edp; edp=$(active_edp)
+  if [ -n "$edp" ]; then edp_on_nvidia "${edp%% *}"; else
+    [ "$(rd "$FA/gpu_mux_mode/current_value")" = 0 ] && echo 1 || echo 0
+  fi
+}
+
+armoury() { run asusctl armoury set "$1" "$2" >/dev/null 2>&1 || { [ "$DRY" = 1 ] || { echo "asusctl could not set $1"; return 1; }; }; }
+
+# dGPU off, live. Refuses when something holds the dGPU; with $1=defer it
+# queues the switch for the next login instead.
+gpu_eco() {
+  local holders
+  if [ "$(booted_ultimate)" = 1 ] || [ "$(rd "$FA/gpu_mux_mode/current_value")" = 0 ]; then
+    echo "Leave Ultimate first"; return 3
+  fi
+  [ "$(rd "$FA/dgpu_disable/current_value")" = 1 ] && return 0
+  holders=$(dgpu_holders)
+  if [ -n "$holders" ]; then
+    if [ "${1:-}" = defer ]; then
+      cfg_set pending_gpu eco
+      echo "Switches at next login. The dGPU is open in $holders"
+      return 0
+    fi
+    echo "The dGPU is open in $holders"; return 3
+  fi
+  armoury dgpu_disable 1
+}
+
+gpu_standard() {
+  if [ "$(rd "$FA/gpu_mux_mode/current_value")" = 0 ]; then
+    armoury gpu_mux_mode 1 || return 1          # back to hybrid, needs a restart
+  fi
+  if [ "$(rd "$FA/dgpu_disable/current_value")" = 1 ]; then
+    armoury dgpu_disable 0 || return 1           # re-enabling is safe live
+  fi
+}
+
+cmd_gpu() {
+  case "${1:-}" in
+    eco)
+      cfg_set optimized 0; cfg_set pending_gpu ""
+      gpu_eco defer; local rc=$?
+      sync_units; return $rc ;;
+    standard)
+      cfg_set optimized 0; cfg_set pending_gpu ""
+      gpu_standard; local rc=$?
+      sync_units; return $rc ;;
+    optimized)
+      if [ "$(booted_ultimate)" = 1 ] || [ "$(rd "$FA/gpu_mux_mode/current_value")" = 0 ]; then
+        echo "Leave Ultimate first"; return 3
+      fi
+      cfg_set optimized 1; cfg_set pending_gpu ""
+      sync_units
+      if [ "$(ac_online)" = 1 ]; then gpu_standard; else
+        local msg; msg=$(gpu_eco defer); [ -n "$msg" ] && echo "$msg"
+      fi ;;
+    ultimate)
+      cfg_set optimized 0; cfg_set pending_gpu ""
+      if [ "$(rd "$FA/dgpu_disable/current_value")" = 1 ]; then armoury dgpu_disable 0 || return 1; fi
+      armoury gpu_mux_mode 0 || return 1
+      sync_units
+      echo "Restart required" ;;
+    *) echo "usage: gpu eco|standard|optimized|ultimate"; return 2 ;;
+  esac
+}
+
+# ── screen ─────────────────────────────────────────────────────────────────────
+
+set_refresh() {  # $1 = low|max
+  local edp name res rate scale pos modes hz
+  edp=$(active_edp); [ -n "$edp" ] || { echo "No internal display"; return 1; }
+  read -r name res rate scale pos modes <<<"$edp"
+  if [ "$1" = low ]; then
+    hz=$(tr ',' '\n' <<<"$modes" | grep "^$res@" | sed 's/.*@\([0-9.]*\)Hz/\1/' | sort -n | head -n1)
+  else
+    hz=$(tr ',' '\n' <<<"$modes" | grep "^$res@" | sed 's/.*@\([0-9.]*\)Hz/\1/' | sort -n | tail -n1)
+  fi
+  [ -n "$hz" ] || return 1
+  # already there? (compare rounded)
+  [ "$(printf '%.0f' "$rate")" = "$(printf '%.0f' "$hz")" ] && return 0
+  # Runtime only: a Hyprland config reload goes back to monitors.lua ("preferred").
+  run hyprctl eval "hl.monitor({ output = \"$name\", mode = \"$res@$hz\", position = \"$pos\", scale = $scale })" >/dev/null
+}
+
+cmd_refresh() {
+  case "${1:-}" in
+    low|max) cfg_set screen_auto 0; set_refresh "$1"; local rc=$?; sync_units; return $rc ;;
+    auto)
+      cfg_set screen_auto 1; sync_units
+      [ "$(ac_online)" = 1 ] && set_refresh max || set_refresh low ;;
+    *) echo "usage: refresh low|max|auto"; return 2 ;;
+  esac
+}
+
+# ── battery / keyboard ─────────────────────────────────────────────────────────
+
+cmd_limit() {
+  local n=${1:-}
+  [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 20 ] && [ "$n" -le 100 ] || { echo "usage: limit 20-100"; return 2; }
+  run asusctl battery limit "$n" >/dev/null
+}
+
+cmd_kbd() {
+  local lv
+  case "${1:-}" in 0) lv=off ;; 1) lv=low ;; 2) lv=med ;; 3) lv=high ;; *) echo "usage: kbd 0-3"; return 2 ;; esac
+  run asusctl leds set "$lv" >/dev/null
+}
+
+# ── automation ─────────────────────────────────────────────────────────────────
+
+apply_policy() {
+  local ac; ac=$(ac_online)
+  if [ "$(cfg_get optimized)" = 1 ]; then
+    if [ "$ac" = 1 ]; then
+      [ "$(rd "$FA/dgpu_disable/current_value")" = 1 ] && { log "AC: enabling dGPU"; armoury dgpu_disable 0; }
+      cfg_set pending_gpu ""
+    else
+      # Only switch off live when nothing holds the dGPU; otherwise wait for
+      # the next login (the login hook applies it before the compositor starts).
+      gpu_eco >/dev/null 2>&1 && log "battery: dGPU off" || log "battery: dGPU busy, deferring Eco"
+    fi
+  fi
+  if [ "$(cfg_get screen_auto)" = 1 ]; then
+    [ "$ac" = 1 ] && set_refresh max || set_refresh low
+  fi
+}
+
+cmd_watch() {
+  command -v udevadm >/dev/null || { log "udevadm missing"; exit 1; }
+  apply_policy
+  exec 3< <(udevadm monitor --udev --subsystem-match=power_supply 2>/dev/null)
+  local last; last=$(ac_online)
+  while :; do
+    read -r -t 60 _ <&3; local rc=$?
+    if [ $rc -ne 0 ] && [ $rc -le 128 ]; then log "udev monitor ended"; exit 1; fi
+    # drain the burst of events, then act once
+    while read -r -t 1 _ <&3; do :; done
+    local now; now=$(ac_online)
+    if [ "$now" != "$last" ] || [ $rc -gt 128 ]; then
+      # on AC change act at once; on the 60 s timeout re-assert (config reloads, deferred Eco)
+      apply_policy; [ "$now" != "$last" ] && on_power_change "$now"; last=$now
+    fi
+  done
+}
+
+# Root-only steps (Silent, RAPL) can't run from a user service without a
+# polkit agent, so hand them to the bar widget, which runs inside the session
+# where Noctalia's agent shows the prompt.
+ask_widget() {
+  noctalia msg plugin ishaan/rog-helper:bar focused act "$1" >/dev/null 2>&1 ||
+    noctalia msg plugin ishaan/rog-helper:bar all act "$1" >/dev/null 2>&1
+}
+
+on_power_change() {
+  sleep 2   # let asusd apply its AC/battery profile first
+  auto_flush_pending
+  if [ "$1" = 0 ] && [ "$(cfg_get bat_silent)" = 1 ] && [ "$(perf_mode)" != silent ]; then
+    log "battery: asking for Silent"; ask_widget perf:silent
+  elif [ -n "$(rapl_script_for "$(perf_mode)")" ]; then
+    log "re-applying CPU power limits"; ask_widget rapl:apply
+  fi
+}
+
+cmd_login_hook() {
+  local pend; pend=$(cfg_get pending_gpu)
+  if [ "$(cfg_get optimized)" = 1 ]; then
+    if [ "$(ac_online)" = 1 ]; then gpu_standard; else pend=eco; fi
+  fi
+  if [ "$pend" = eco ] && [ "$(rd "$FA/gpu_mux_mode/current_value")" = 1 ]; then
+    armoury dgpu_disable 1 && log "login: dGPU off"
+  fi
+  cfg_set pending_gpu ""
+  # Only drop our own symlink here; starting/restarting units from a unit that
+  # orders before graphical-session-pre.target would deadlock the login.
+  [ "$(cfg_get optimized)" = 1 ] || run systemctl --user disable -q "$LOGIN_UNIT"
+}
+
+case "${1:-}" in
+  status) cmd_status ;;
+  status-extra) cmd_status_extra ;;
+  perf) shift; cmd_perf "$@" ;;
+  rapl) shift; cmd_rapl "$@" ;;
+  rapl-apply) rapl_apply_for "$(perf_mode)" ;;
+  boost) shift; cmd_boost "$@" ;;
+  auto) shift; cmd_auto "$@" ;;
+  fan) shift; cmd_fan "$@" ;;
+  aura) shift; cmd_aura "$@" ;;
+  slash) shift; cmd_slash "$@" ;;
+  aura-power) shift; cmd_aura_power "$@" ;;
+  boot-sound) shift; cmd_boot_sound "$@" ;;
+  oneshot) run asusctl battery oneshot >/dev/null ;;
+  gpu) shift; cmd_gpu "$@" ;;
+  refresh) shift; cmd_refresh "$@" ;;
+  limit) shift; cmd_limit "$@" ;;
+  kbd) shift; cmd_kbd "$@" ;;
+  holders) dgpu_holders ;;
+  watch) cmd_watch ;;
+  login-hook) cmd_login_hook ;;
+  *) sed -n '2,33p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
