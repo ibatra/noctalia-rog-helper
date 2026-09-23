@@ -10,6 +10,7 @@
 
 local ROGCTL = (noctalia.pluginDir() or noctalia.expandPath("~/.local/share/noctalia-plugins/rog-helper")) .. "/bin/rogctl"
 local REFRESH_EVERY = 5 -- seconds
+local REFRESH_EXTRA_EVERY = 15 -- seconds, sub-views only (several asusctl calls)
 
 local st = {} -- main snapshot (rogctl status)
 local ex = {} -- extra snapshot (rogctl status-extra), loaded for the sub-views
@@ -20,6 +21,7 @@ local hover = ""
 local ticks = 0
 local isOpen = false
 local loading, loadingExtra = false, false
+local reloadAgain, reloadExtraAgain = false, false -- asked for while one was in flight
 
 local view = "main" -- main | power | fans | lighting
 local powerMode = nil -- which mode's CPU limits are being edited
@@ -31,6 +33,10 @@ local themeHex = nil
 -- ── helpers ───────────────────────────────────────────────────────────────────
 
 local function num(v) return tonumber(v or "") end
+
+-- Capability flag from rogctl ("has_*"). Unknown until the first snapshot,
+-- which counts as present so nothing flickers away on open.
+local function has(t, key) return t["has_" .. key] ~= "0" end
 
 local function parse(out)
   local t = {}
@@ -66,28 +72,50 @@ end
 
 local render
 
+-- A fresh snapshot replaces the optimistic picks, except for sections whose
+-- command is still running (e.g. Silent waiting on the password prompt).
+local function dropSettledPicks()
+  for k in pairs(picked) do
+    if not busy[k] then picked[k] = nil end
+  end
+end
+
 local function refresh()
-  if loading then return end
+  if loading then
+    reloadAgain = true -- the snapshot in flight may predate a change
+    return
+  end
   loading = true
   noctalia.runAsync({ ROGCTL, "status" }, function(res)
     loading = false
     if res.exitCode == 0 then
       st = parse(res.stdout)
-      picked = {}
+      dropSettledPicks()
       noctalia.state.set("rog.status", st)
+    end
+    if reloadAgain then
+      reloadAgain = false
+      refresh()
     end
     if isOpen then render() end
   end, 5000)
 end
 
 local function refreshExtra()
-  if loadingExtra then return end
+  if loadingExtra then
+    reloadExtraAgain = true
+    return
+  end
   loadingExtra = true
   noctalia.runAsync({ ROGCTL, "status-extra" }, function(res)
     loadingExtra = false
     if res.exitCode == 0 then
       ex = parse(res.stdout)
-      picked = {}
+      dropSettledPicks()
+    end
+    if reloadExtraAgain then
+      reloadExtraAgain = false
+      refreshExtra()
     end
     if isOpen then render() end
   end, 8000)
@@ -376,6 +404,8 @@ local function perfSection()
 end
 
 local function gpuSection()
+  local canOff, canMux = has(st, "dgpu_disable"), has(st, "mux")
+  if not canOff and not canMux then return nil end
   local sel = picked.gpu or gpuMode()
   local ult = inUltimate()
   local function pick(id) return function() act("gpu", id, { "gpu", id }) end end
@@ -394,18 +424,22 @@ local function gpuSection()
   if noteText and not notes.gpu then setNote("gpu", noteText, "muted") end
   if not noteText and notes.gpu and not notes.gpu.expires then notes.gpu = nil end
 
-  return section({
-    choices("tile", "gpu", {
-      { id = "eco", label = "Eco", glyph = "leaf", enabled = not ult, onClick = pick("eco") },
-      { id = "standard", label = "Standard", glyph = "device-laptop", onClick = pick("standard") },
-      { id = "optimized", label = "Optimized", glyph = "sparkles", enabled = not ult, onClick = pick("optimized") },
-      { id = "ultimate", label = "Ultimate", glyph = "bolt", onClick = pick("ultimate") },
-    }, sel),
-    noteRow("gpu", restart),
-  })
+  local opts = {}
+  if canOff then
+    opts[#opts + 1] = { id = "eco", label = "Eco", glyph = "leaf", enabled = not ult, onClick = pick("eco") }
+  end
+  opts[#opts + 1] = { id = "standard", label = "Standard", glyph = "device-laptop", onClick = pick("standard") }
+  if canOff then
+    opts[#opts + 1] = { id = "optimized", label = "Optimized", glyph = "sparkles", enabled = not ult, onClick = pick("optimized") }
+  end
+  if canMux then
+    opts[#opts + 1] = { id = "ultimate", label = "Ultimate", glyph = "bolt", onClick = pick("ultimate") }
+  end
+  return section({ choices("tile", "gpu", opts, sel), noteRow("gpu", restart) })
 end
 
 local function screenSection()
+  if not has(st, "edp") then return nil end
   local low, max = st.refresh_low or "60", st.refresh_max or "240"
   local sel = picked.screen or (st.screen_auto == "1" and "auto") or (st.refresh == low and "low") or "max"
   local function pick(id) return function() act("screen", id, { "refresh", id }) end end
@@ -420,6 +454,7 @@ local function screenSection()
 end
 
 local function batterySection()
+  if not has(st, "limit") then return nil end
   local cur = num(st.limit)
   local values = { 60, 80, 100 }
   if cur and cur ~= 60 and cur ~= 80 and cur ~= 100 then
@@ -445,6 +480,7 @@ local function batterySection()
 end
 
 local function keyboardSection()
+  if not has(st, "kbd") then return nil end
   local opts = {}
   for i, n in ipairs({ "Off", "Low", "Medium", "High" }) do
     local id = tostring(i - 1)
@@ -471,11 +507,21 @@ local function navButton(id, glyph, text)
   })
 end
 
+-- Children without the nil holes left by sections this machine lacks.
+local function packed(...)
+  local out = {}
+  for i = 1, select("#", ...) do
+    local v = select(i, ...)
+    if v then out[#out + 1] = v end
+  end
+  return out
+end
+
 local function mainView()
   return {
     header(),
-    ui.column({ gap = 8 }, { perfSection(), gpuSection() }),
-    ui.column({ gap = 8 }, { screenSection(), batterySection(), keyboardSection() }),
+    ui.column({ gap = 8 }, packed(perfSection(), gpuSection())),
+    ui.column({ gap = 8 }, packed(screenSection(), batterySection(), keyboardSection())),
     ui.row({ gap = 4 }, {
       navButton("power", "gauge", "Power"),
       navButton("fans", "propeller", "Fans"),
@@ -538,7 +584,8 @@ local function powerView()
   local batSel = picked.auto_battery
   if not batSel then
     local p = ex.auto_pending_battery
-    batSel = (ex.bat_silent == "1") and "silent" or p == "Performance" and "turbo" or p == "Balanced" and "balanced" or ex.auto_battery
+    batSel = (ex.bat_silent == "1" or p == "Quiet" or p == "LowPower") and "silent"
+      or p == "Performance" and "turbo" or p == "Balanced" and "balanced" or ex.auto_battery
   end
   local function auto(src, id) return function() act("auto_" .. src, id, { "auto", src, id }, "extra") end end
 
@@ -550,24 +597,16 @@ local function powerView()
     end }
   end
 
-  return {
-    subHeader("Power", `CPU base {ex.cpu_base_power or "?"} W, dGPU {ex.gpu_base_tgp or "?"} W`),
-    section({
-      label("When plugged in"),
-      choices("segment", "auto_ac", {
-        { id = "balanced", label = "Balanced", onClick = auto("ac", "balanced") },
-        { id = "turbo", label = "Turbo", onClick = auto("ac", "turbo") },
-      }, acSel),
-      label("On battery"),
-      choices("segment", "auto_battery", {
-        { id = "silent", label = "Silent", onClick = auto("battery", "silent") },
-        { id = "balanced", label = "Balanced", onClick = auto("battery", "balanced") },
-        { id = "turbo", label = "Turbo", onClick = auto("battery", "turbo") },
-      }, batSel),
-      noteRow("auto_ac"),
-      noteRow("auto_battery"),
-    }),
-    section({
+  -- Without asusd's Quiet, Silent is a pkexec write, so the automatic switch
+  -- after each unplug asks for the password.
+  local batNote = noteRow("auto_battery")
+  if not batNote and batSel == "silent" and ex.silent_needs_root ~= "0" then
+    batNote = caption("Switching to Silent after unplugging asks for your password")
+  end
+
+  local limits = nil
+  if has(ex, "rapl") then
+    limits = section({
       label("CPU power limits", custom and "Custom" or "Firmware"),
       choices("segment", "plmode", modeTabs, mode),
       ui.row({ align = "center", gap = 8 }, {
@@ -601,12 +640,33 @@ local function powerView()
         end }),
       }),
       noteRow("rapl") or caption("Caps only. Applying asks for your password"),
+    })
+  end
+  local boost = has(ex, "boost") and toggleRow("CPU boost", (picked.boost or ex.boost) == "1", function(v)
+    act("boost", v == "true" and "1" or "0", { "boost", v == "true" and "on" or "off" }, "extra")
+  end) or nil
+
+  return packed(
+    subHeader("Power", `CPU base {ex.cpu_base_power or "?"} W, dGPU {ex.gpu_base_tgp or "?"} W`),
+    section({
+      label("When plugged in"),
+      choices("segment", "auto_ac", {
+        { id = "balanced", label = "Balanced", onClick = auto("ac", "balanced") },
+        { id = "turbo", label = "Turbo", onClick = auto("ac", "turbo") },
+      }, acSel),
+      label("On battery"),
+      choices("segment", "auto_battery", {
+        { id = "silent", label = "Silent", onClick = auto("battery", "silent") },
+        { id = "balanced", label = "Balanced", onClick = auto("battery", "balanced") },
+        { id = "turbo", label = "Turbo", onClick = auto("battery", "turbo") },
+      }, batSel),
+      noteRow("auto_ac"),
+      batNote,
     }),
-    toggleRow("CPU boost", (picked.boost or ex.boost) == "1", function(v)
-      act("boost", v == "true" and "1" or "0", { "boost", v == "true" and "on" or "off" }, "extra")
-    end),
-    noteRow("boost"),
-  }
+    limits,
+    boost,
+    boost and noteRow("boost")
+  )
 end
 
 -- ── fans view ─────────────────────────────────────────────────────────────────
@@ -641,8 +701,9 @@ end
 
 -- Preview curve for a preset without asking rogctl (same maths as fan_preset).
 local function presetSpec(spec, preset)
-  if not spec or preset == "default" then return spec end
+  if not spec or spec == "" or preset == "default" then return spec end
   local ts, ps = spec:match("^([^;]*);([^;]*)")
+  if not ts then return spec end
   local T, out, prev = {}, {}, 0
   for v in ts:gmatch("%d+") do T[#T + 1] = tonumber(v) end
   local i = 0
@@ -664,10 +725,16 @@ end
 
 local function fansView()
   if not ex.stock_balanced_cpu then return loadingView("Fans") end
+  if not has(ex, "fan_curves") then
+    return { subHeader("Fans"), caption("This model doesn't expose fan curves") }
+  end
   local prof = fanProfile or (st.perf == "turbo" and "performance" or "balanced")
   fanProfile = prof
   local saved = ex["fan_" .. prof] or ""
   local preset = picked["fan_" .. prof] or (saved ~= "" and saved) or "default"
+  -- Quiet and Cool are built from the stock curve, seen only while custom
+  -- curves are off
+  local stockKnown = (ex["stock_" .. prof .. "_cpu"] or "") ~= "" and (ex["stock_" .. prof .. "_gpu"] or "") ~= ""
   local showCpu = presetSpec(ex["stock_" .. prof .. "_cpu"], preset)
   local showGpu = presetSpec(ex["stock_" .. prof .. "_gpu"], preset)
 
@@ -700,11 +767,12 @@ local function fansView()
       label("Preset"),
       choices("segment", "fan_" .. prof, {
         { id = "default", label = "Stock", onClick = pick("default") },
-        { id = "quiet", label = "Quiet", onClick = pick("quiet") },
-        { id = "cool", label = "Cool", onClick = pick("cool") },
+        { id = "quiet", label = "Quiet", enabled = stockKnown, onClick = pick("quiet") },
+        { id = "cool", label = "Cool", enabled = stockKnown, onClick = pick("cool") },
       }, preset),
       noteRow("fan_" .. prof),
-      caption(st.perf == "silent" and "Silent always uses the firmware curve" or "Never quieter than stock above 70°"),
+      caption(not stockKnown and "Stock curve unknown: pick Stock (or reset curves in asusctl) first"
+        or st.perf == "silent" and "Silent always uses the firmware curve" or "Never quieter than stock above 70°"),
     }),
   }
 end
@@ -776,10 +844,13 @@ local function lightingKeyboard()
     kbdOpts[#kbdOpts + 1] = { id = id, label = n, onClick = function() act("kbd", id, { "kbd", id }) end }
   end
 
-  local parts = {
-    iconRow("sun", choices("segment", "kbd", kbdOpts, picked.kbd or st.kbd)),
-    section({ iconRow("sparkles", choices("segment", "aura", effectOpts, cur)), noteRow("aura") }),
-  }
+  local parts = {}
+  if has(st, "kbd") then parts[#parts + 1] = iconRow("sun", choices("segment", "kbd", kbdOpts, picked.kbd or st.kbd)) end
+  if not has(ex, "aura") then
+    if #parts == 0 then parts[1] = caption("No keyboard lighting controls on this model") end
+    return parts
+  end
+  parts[#parts + 1] = section({ iconRow("sparkles", choices("segment", "aura", effectOpts, cur)), noteRow("aura") })
   if cur == "static" or cur == "breathe" or cur == "pulse" then
     parts[#parts + 1] = section({ label("Colour"), colourRow(1, c1, function(h) apply(cur, h) end) })
   end
@@ -815,10 +886,11 @@ local function lightingSlash()
   end
   local bright = num(ex.slash_brightness) or 255
 
-  local parts = {
-    toggleRow("Slash lighting", on, function(v) act("slash", v == "true" and "1" or "0", { "slash", v == "true" and "on" or "off" }, "extra") end),
-  }
-  if on then
+  local parts = {}
+  if has(ex, "slash") then
+    parts[1] = toggleRow("Slash lighting", on, function(v) act("slash", v == "true" and "1" or "0", { "slash", v == "true" and "on" or "off" }, "extra") end)
+  end
+  if on and has(ex, "slash") then
     parts[#parts + 1] = ui.row({ gap = 8, align = "center" }, {
       ui.select({ options = modes, selectedIndex = modeIdx, controlSize = "sm", flexGrow = 1,
         onChange = function(_i, text) act("slash_mode", text, { "slash", "mode", text }, "extra") end }),
@@ -844,24 +916,29 @@ local function lightingSlash()
       end),
     })
   end
-  parts[#parts + 1] = section({
-    label("Keyboard lights on"),
-    ui.row({ gap = 5 }, { powerChip(2, "Awake"), powerChip(3, "Sleep"), powerChip(1, "Boot"), powerChip(4, "Shutdown") }),
-    noteRow("aura_power"),
-  })
-  parts[#parts + 1] = toggleRow("Boot sound", (picked.boot_sound or ex.boot_sound) == "1", function(v)
-    act("boot_sound", v == "true" and "1" or "0", { "boot-sound", v == "true" and "on" or "off" }, "extra")
-  end)
+  if ex.aura_power then
+    parts[#parts + 1] = section({
+      label("Keyboard lights on"),
+      ui.row({ gap = 5 }, { powerChip(2, "Awake"), powerChip(3, "Sleep"), powerChip(1, "Boot"), powerChip(4, "Shutdown") }),
+      noteRow("aura_power"),
+    })
+  end
+  if has(ex, "boot_sound") then
+    parts[#parts + 1] = toggleRow("Boot sound", (picked.boot_sound or ex.boot_sound) == "1", function(v)
+      act("boot_sound", v == "true" and "1" or "0", { "boot-sound", v == "true" and "on" or "off" }, "extra")
+    end)
+  end
+  if #parts == 0 then parts[1] = caption("Nothing else to set on this model") end
   return parts
 end
 
 local function lightingView()
-  if not ex.aura_mode then return loadingView("Lighting") end
+  if not ex.has_aura then return loadingView("Lighting") end
   local body = {
     subHeader("Lighting"),
     choices("segment", "lighttab", {
       { id = "keyboard", label = "Keyboard", onClick = function() lightTab = "keyboard"; render() end },
-      { id = "slash", label = "Slash and more", onClick = function() lightTab = "slash"; render() end },
+      { id = "slash", label = has(ex, "slash") and "Slash and more" or "More", onClick = function() lightTab = "slash"; render() end },
     }, lightTab),
   }
   for _, p in ipairs(lightTab == "keyboard" and lightingKeyboard() or lightingSlash()) do body[#body + 1] = p end
@@ -945,6 +1022,11 @@ function update()
   ticks += 1
   if ticks % REFRESH_EVERY == 0 then
     refresh()
+  end
+  -- external changes (Fn keys, asusctl, rog-control-center) show up in the
+  -- sub-views too
+  if view ~= "main" and ticks % REFRESH_EXTRA_EVERY == 0 then
+    refreshExtra()
   end
 end
 

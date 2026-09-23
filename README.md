@@ -26,7 +26,10 @@ Not affiliated with G-Helper or ASUS; it drives the same knobs through `asusctl`
 - **Power**: CPU PL1/PL2 limits per mode via Intel RAPL, 5 W up to the firmware default (can only lower power; like G-Helper, no custom limits unless you set them), CPU boost.
 - **Slash** LED bar and boot sound, on models that have them.
 
-Every control is probed first and hidden if the machine doesn't support it.
+Controls the machine doesn't have (dGPU switch, MUX, internal display refresh rate, keyboard
+backlight, charge limit, CPU power limits, CPU boost, fan curves, Aura, Slash, boot sound) are
+hidden. Only the GU606AW has been tested, so other models may still show a control that does
+nothing.
 
 ## Requirements
 
