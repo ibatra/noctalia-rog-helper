@@ -37,13 +37,19 @@ nothing.
 - `asusctl` / `asusd` 6.5+
 - `power-profiles-daemon`
 - `pkexec` and a polkit agent (Noctalia's built-in one works) for the few root-only actions
+- `fuser` (`psmisc`); without it Eco is always deferred to the next login
 - Hyprland for the refresh-rate control (everything else is compositor-agnostic)
+- For the automations (Optimized, Auto refresh, Silent on battery, per-source profiles, custom
+  CPU limits): a systemd-managed graphical session, e.g. Hyprland started through
+  [uwsm](https://github.com/Vladimir-csp/uwsm). The units hang off `graphical-session.target`,
+  which plain Hyprland from a TTY or a display manager never starts, so they would silently not
+  run.
 
 ## Install
 
 ```sh
-git clone https://github.com/ibatra/noctalia-rog-helper ~/.local/share/noctalia-plugins
-noctalia msg plugins source add local path ~/.local/share/noctalia-plugins
+git clone https://github.com/ibatra/noctalia-rog-helper ~/.local/share/noctalia-rog-helper
+noctalia msg plugins source add local path ~/.local/share/noctalia-rog-helper
 noctalia msg plugins enable ishaan/rog-helper
 ```
 
@@ -62,17 +68,22 @@ hl.bind("XF86Launch1", hl.dsp.exec_cmd("noctalia msg panel-toggle ishaan/rog-hel
 
 ## Things to know
 
-- **Silent needs your password.** On Intel Panther Lake models the kernel hides the Quiet
-  profile (see [asusctl#387](https://github.com/OpenGamingCollective/asusctl/issues/387)), so
-  Silent writes each platform-profile handler directly through `pkexec`. CPU power limits and
-  CPU boost also use `pkexec`.
-- **Eco waits for the next login** if the compositor has the dGPU open, because cutting its
-  power under a running session can crash it. Ultimate needs a restart.
-- **Optimized and Auto** install two small systemd user units (`rog-helper-login`,
-  `rog-helper-auto`) only when you pick them, and remove them when you switch away.
+- **Silent may need your password.** When `asusctl profile list` offers Quiet, Silent goes
+  through asusd like the other modes. On Intel Panther Lake models the kernel hides Quiet (see
+  [asusctl#387](https://github.com/OpenGamingCollective/asusctl/issues/387)), so until a fixed
+  kernel or asusd is installed, Silent writes each platform-profile handler directly through
+  `pkexec`, and Silent on battery asks for the password after every unplug. CPU power limits and
+  CPU boost also use `pkexec`; limits only prompt when they actually need to change.
+- **Eco waits for the next login** if anything has the dGPU open or awake (the compositor,
+  `nvidia-powerd`, `nvidia-persistenced`), because cutting its power under a running session can
+  crash it. Ultimate needs a restart.
+- **Optimized, Auto refresh, Silent on battery, deferred per-source profiles and custom CPU
+  limits** install two small systemd user units (`rog-helper-login`, `rog-helper-auto`). They
+  are disabled when nothing needs them; the files stay in `~/.config/systemd/user`.
 - The plugin never uses `nvidia-smi` or NVML, since that would wake a sleeping dGPU.
-- `touch ~/.config/rog-helper/dry-run` (or the plugin's `dry_run` setting) turns every action
-  into a notification showing the command it would run.
+- `touch ~/.config/rog-helper/dry-run` (or the plugin's `dry_run` setting, which creates that
+  file for the background units) turns every action into a notification or log line showing the
+  command it would run.
 
 ## Status
 
