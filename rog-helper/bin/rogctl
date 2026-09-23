@@ -970,10 +970,16 @@ cmd_watch() {
 
 # Root-only steps (Silent, RAPL) can't run from a user service without a
 # polkit agent, so hand them to the bar widget, which runs inside the session
-# where Noctalia's agent shows the prompt.
+# where Noctalia's agent shows the prompt. The widget on the focused output
+# first; "all" only when that has none (the widgets share one busy flag, so
+# only one of them acts). A dry run here stays a dry run there.
 ask_widget() {
-  noctalia msg plugin ishaan/rog-helper:bar focused act "$1" >/dev/null 2>&1 ||
-    noctalia msg plugin ishaan/rog-helper:bar all act "$1" >/dev/null 2>&1
+  local t ev=$1; [ "$DRY" = 1 ] && ev="$1:dry"
+  for t in focused all; do
+    noctalia msg plugin ishaan/rog-helper:bar "$t" act "$ev" >/dev/null 2>&1 && return 0
+  done
+  log "no ROG helper bar widget took $1 (add it to a bar)"
+  return 1
 }
 
 on_power_change() {

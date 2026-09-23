@@ -106,20 +106,60 @@ function onClick()
   noctalia.togglePanel(PANEL)
 end
 
+-- The plugin's dry_run setting has to reach the systemd units too, and they
+-- only see ~/.config/rog-helper/dry-run. The flag is written with a marker, so
+-- turning the setting off never removes a flag the user touched by hand.
+local FLAG_MARK = "set by the ROG helper plugin's dry_run setting\n"
+local function syncDryRunFlag()
+  local conf = noctalia.getenv("XDG_CONFIG_HOME") or ""
+  if conf == "" then conf = noctalia.expandPath("~/.config") end
+  local flag = conf .. "/rog-helper/dry-run"
+  if noctalia.getConfig("dry_run") == true then
+    if not noctalia.fileExists(flag) then
+      noctalia.mkdirAll(conf .. "/rog-helper")
+      noctalia.writeFile(flag, FLAG_MARK)
+    end
+  elseif noctalia.fileExists(flag) and noctalia.readFile(flag) == FLAG_MARK then
+    noctalia.removeFile(flag)
+  end
+end
+
+syncDryRunFlag()
+
+function onConfigChanged()
+  syncDryRunFlag()
+end
+
 -- The power-source watcher (rog-helper-auto.service) can't show a polkit
 -- prompt from a user service, so it asks this widget, which runs inside the
 -- session:  noctalia msg plugin ishaan/rog-helper:bar focused act perf:silent
+-- A trailing ":dry" means the watcher itself is in dry-run mode.
 local ROGCTL = (noctalia.pluginDir() or noctalia.expandPath("~/.local/share/noctalia-plugins/rog-helper")) .. "/bin/rogctl"
-local running = false
+local ACTIONS = { ["perf:silent"] = { "perf", "silent" }, ["rapl:apply"] = { "rapl-apply" } }
+local BUSY = "rog.bgBusy" -- shared by every instance, so only one acts
 function onIpc(event, payload)
-  if event ~= "act" or running then return end
-  local argv
-  if payload == "perf:silent" then argv = { ROGCTL, "perf", "silent" }
-  elseif payload == "rapl:apply" then argv = { ROGCTL, "rapl-apply" } end
-  if not argv then return end
-  running = true
-  noctalia.runAsync(argv, function(_res)
-    running = false
+  if event ~= "act" or type(payload) ~= "string" then return end
+  local what, tail = payload:match("^(%a+:%a+)(.*)$")
+  local args = what and ACTIONS[what]
+  if not args then return end
+  local since = noctalia.state.get(BUSY)
+  if type(since) == "number" and noctalia.nowMs() - since < 70000 then return end
+  noctalia.state.set(BUSY, noctalia.nowMs())
+
+  local dry = tail == ":dry" or noctalia.getConfig("dry_run") == true
+  local argv = { ROGCTL }
+  if dry then argv[#argv + 1] = "--dry-run" end
+  for _, a in ipairs(args) do argv[#argv + 1] = a end
+  noctalia.runAsync(argv, function(res)
+    noctalia.state.set(BUSY, 0)
+    local cmds = {}
+    for line in (res.stderr or ""):gmatch("[^\n]+") do
+      local c = line:match("^dry%-run: (.*)$")
+      if c then cmds[#cmds + 1] = c end
+    end
+    if dry or #cmds > 0 then
+      noctalia.notify("ROG helper dry run", #cmds > 0 and table.concat(cmds, "\n") or "Nothing to do")
+    end
     render()
   end, 60000)
 end

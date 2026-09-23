@@ -875,6 +875,32 @@ render = function()
   panel.render(ui.column({ flexGrow = 1, gap = 14 }, { ui.column({ key = "view:" .. view, flexGrow = 1, gap = 14 }, kids) }))
 end
 
+-- The plugin's dry_run setting has to reach the systemd units too, and they
+-- only see ~/.config/rog-helper/dry-run (the bar widget does the same). The
+-- flag is written with a marker, so turning the setting off never removes a
+-- flag the user touched by hand.
+local FLAG_MARK = "set by the ROG helper plugin's dry_run setting\n"
+local function syncDryRunFlag()
+  local conf = noctalia.getenv("XDG_CONFIG_HOME") or ""
+  if conf == "" then conf = noctalia.expandPath("~/.config") end
+  local flag = conf .. "/rog-helper/dry-run"
+  if noctalia.getConfig("dry_run") == true then
+    if not noctalia.fileExists(flag) then
+      noctalia.mkdirAll(conf .. "/rog-helper")
+      noctalia.writeFile(flag, FLAG_MARK)
+    end
+  elseif noctalia.fileExists(flag) and noctalia.readFile(flag) == FLAG_MARK then
+    noctalia.removeFile(flag)
+  end
+end
+
+syncDryRunFlag()
+
+function onConfigChanged()
+  syncDryRunFlag()
+  if isOpen then render() end
+end
+
 noctalia.state.watch("rog.draw", function(_v)
   if isOpen and view == "main" then render() end
 end)
