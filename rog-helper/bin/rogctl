@@ -346,7 +346,7 @@ cmd_rapl() {
     set)
       p1=${3:-}; p2=${4:-}
       [[ "$p1" =~ ^[0-9]+$ && "$p2" =~ ^[0-9]+$ ]] || { echo "usage: rapl set <mode> PL1 PL2"; return 2; }
-      [ "$p1" -ge 10 ] || { echo "Sustained limit must be at least 10 W"; return 3; }
+      [ "$p1" -ge 5 ] || { echo "Sustained limit must be at least 5 W"; return 3; }
       [ "$p2" -ge "$p1" ] || { echo "Boost limit must be at least the sustained limit"; return 3; }
       [ "$p1" -le "${d% *}" ] && [ "$p2" -le "${d#* }" ] || { echo "Above the firmware default"; return 3; }
       if [ "$p1" = "${d% *}" ] && [ "$p2" = "${d#* }" ]; then cfg_set "pl_$mode" ""; else cfg_set "pl_$mode" "$p1,$p2"; fi ;;

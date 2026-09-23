@@ -22,7 +22,7 @@ Not affiliated with G-Helper or ASUS; it drives the same knobs through `asusctl`
   lighting power states.
 - **Fans**: CPU/GPU curves per profile, with Stock / Quiet / Cool presets. Curves that would run
   cooler than stock at high temperatures are rejected.
-- **Power**: CPU PL1/PL2 limits per mode via Intel RAPL (can only lower power), CPU boost.
+- **Power**: CPU PL1/PL2 limits per mode via Intel RAPL, 5 W up to the firmware default (can only lower power; like G-Helper, no custom limits unless you set them), CPU boost.
 - **Slash** LED bar and boot sound, on models that have them.
 
 Every control is probed first and hidden if the machine doesn't support it.

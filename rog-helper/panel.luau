@@ -560,7 +560,7 @@ local function powerView()
       choices("segment", "plmode", modeTabs, mode),
       ui.row({ align = "center", gap = 8 }, {
         ui.label({ text = "Sustained", fontSize = 12, color = "on_surface", width = 76 }),
-        ui.slider({ key = "pl1:" .. mode, min = 10, max = max1, step = 1, value = d.pl1, flexGrow = 1, controlSize = "sm",
+        ui.slider({ key = "pl1:" .. mode, min = 5, max = max1, step = 1, value = d.pl1, flexGrow = 1, controlSize = "sm",
           onChange = function(v)
             d.pl1 = math.floor(tonumber(v) or d.pl1)
             if d.pl2 < d.pl1 then d.pl2 = d.pl1 end
@@ -570,7 +570,7 @@ local function powerView()
       }),
       ui.row({ align = "center", gap = 8 }, {
         ui.label({ text = "Boost", fontSize = 12, color = "on_surface", width = 76 }),
-        ui.slider({ key = "pl2:" .. mode, min = 10, max = max2, step = 1, value = d.pl2, flexGrow = 1, controlSize = "sm",
+        ui.slider({ key = "pl2:" .. mode, min = 5, max = max2, step = 1, value = d.pl2, flexGrow = 1, controlSize = "sm",
           onChange = function(v)
             d.pl2 = math.floor(tonumber(v) or d.pl2)
             if d.pl1 > d.pl2 then d.pl1 = d.pl2 end
