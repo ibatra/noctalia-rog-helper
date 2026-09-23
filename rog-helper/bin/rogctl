@@ -290,6 +290,7 @@ cmd_perf() {
         if [ $rc = 126 ] || [ $rc = 127 ]; then echo "Cancelled"; return 3; fi
         echo "Could not switch to Silent"; return 1
       fi
+      [ -n "$rs" ] && [ "$DRY" = 0 ] && rapl_record silent
       ;;
     balanced|turbo)
       local ppd asusp
@@ -314,7 +315,10 @@ cmd_perf() {
 # Limits are caps: the lower of RAPL and the firmware's own budget wins. Per-mode
 # custom values live in the state file as pl_<mode>=PL1,PL2 (watts). The BIOS
 # values seen before we ever wrote anything are kept as rapl_default_pl1/2 and
-# are also the ceiling, so a custom limit can only ever lower power.
+# are also the ceiling, so a custom limit can only ever lower power. The last
+# custom pair rogctl put in place is kept as rapl_applied: a mode without its
+# own limits only goes back to the default when the live values are ours, so
+# per-profile limits the firmware sets itself are left alone.
 
 rapl_dirs() {
   local d
@@ -337,28 +341,59 @@ rapl_defaults() {
   d1=$(cfg_get rapl_default_pl1); d2=$(cfg_get rapl_default_pl2)
   if [ -z "$d1" ] || [ -z "$d2" ]; then
     d1=$(rapl_w 0); d2=$(rapl_w 1)
-    if [ -z "$(cfg_get pl_silent)$(cfg_get pl_balanced)$(cfg_get pl_turbo)" ] && [ "$d1" -gt 0 ]; then
+    if [ -z "$(cfg_get pl_silent)$(cfg_get pl_balanced)$(cfg_get pl_turbo)$(cfg_get rapl_applied)" ] && [ "$d1" -gt 0 ]; then
       cfg_set rapl_default_pl1 "$d1"; cfg_set rapl_default_pl2 "$d2"
     fi
   fi
   echo "$d1 $d2"
 }
 
-rapl_target() {  # "PL1 PL2" wanted for mode $1
-  local c; c=$(cfg_get "pl_$1")
-  if [ -n "$c" ]; then echo "${c%,*} ${c#*,}"; else rapl_defaults; fi
+rapl_num() { [[ "${1:-}" =~ ^[0-9]{1,4}$ ]]; }
+
+# "PL1 PL2" wanted for mode $1. Everything comes from the state file, which is
+# plain user data, so it is checked before it can reach a root write: empty
+# when a value is malformed or outside 5 <= PL1 <= PL2 <= firmware default.
+rapl_target() {
+  local c d p1 p2 d1 d2
+  d=$(rapl_defaults); d1=${d% *}; d2=${d#* }
+  c=$(cfg_get "pl_$1")
+  if [ -n "$c" ]; then p1=${c%,*}; p2=${c#*,}; else p1=$d1; p2=$d2; fi
+  rapl_num "$p1" && rapl_num "$p2" && rapl_num "$d1" && rapl_num "$d2" || return 0
+  p1=$((10#$p1)); p2=$((10#$p2)); d1=$((10#$d1)); d2=$((10#$d2))
+  [ "$p1" -ge 5 ] && [ "$p1" -le "$p2" ] && [ "$p1" -le "$d1" ] && [ "$p2" -le "$d2" ] || return 0
+  echo "$p1 $p2"
 }
 
-# sh snippet that sets mode $1's limits, empty when they are already in place
+rapl_ours() {  # "PL1 PL2" -> success when rogctl wrote these values
+  local v=${1/ /,} m
+  [ "$(cfg_get rapl_applied)" = "$v" ] && return 0
+  for m in silent balanced turbo; do [ "$(cfg_get "pl_$m")" = "$v" ] && return 0; done
+  return 1
+}
+
+# sh snippet that sets mode $1's limits, empty when there is nothing to do
 rapl_script_for() {
-  local t p1 p2 d s=""
+  local t p1 p2 cur d s=""
+  case "${1:-}" in silent|balanced|turbo) ;; *) return 0 ;; esac
   [ -n "$(rapl_dirs)" ] || return 0
-  t=$(rapl_target "$1"); p1=${t% *}; p2=${t#* }
-  [ "$(rapl_w 0)" = "$p1" ] && [ "$(rapl_w 1)" = "$p2" ] && return 0
+  t=$(rapl_target "$1"); [ -n "$t" ] || return 0
+  p1=${t% *}; p2=${t#* }
+  cur="$(rapl_w 0) $(rapl_w 1)"
+  [ "$cur" = "$t" ] && return 0
+  # no custom limits for this mode: only undo what we wrote ourselves
+  [ -n "$(cfg_get "pl_$1")" ] || rapl_ours "$cur" || return 0
   for d in $(rapl_dirs); do
     s="${s:+$s && }echo $((p1 * 1000000)) > $d/constraint_0_power_limit_uw && echo $((p2 * 1000000)) > $d/constraint_1_power_limit_uw"
   done
   echo "$s"
+}
+
+# After a write: success when mode $1's limits are live, and remember a custom
+# pair as ours (the default needs no undoing).
+rapl_record() {
+  local t; t=$(rapl_target "$1")
+  [ -n "$t" ] && [ "$(rapl_w 0) $(rapl_w 1)" = "$t" ] || return 1
+  if [ -n "$(cfg_get "pl_$1")" ]; then cfg_set rapl_applied "${t/ /,}"; else cfg_set rapl_applied ""; fi
 }
 
 rapl_apply_for() {
@@ -368,17 +403,20 @@ rapl_apply_for() {
   if [ $rc != 0 ]; then echo "Power limits not applied"; return 0; fi
   [ "$DRY" = 1 ] && return 0
   sleep 1
-  [ -z "$(rapl_script_for "$1")" ] || echo "Firmware kept its own power limits"
+  rapl_record "$1" || echo "Firmware kept its own power limits"
 }
 
 cmd_rapl() {
   local mode=${2:-} d p1 p2
   case "$mode" in silent|balanced|turbo) ;; *) echo "usage: rapl set|reset <mode> [PL1 PL2]"; return 2 ;; esac
+  [ -n "$(rapl_dirs)" ] || { echo "No CPU power limit control"; return 3; }
   d=$(rapl_defaults)
+  rapl_num "${d% *}" && rapl_num "${d#* }" || { echo "Firmware default unknown"; return 1; }
   case "${1:-}" in
     set)
       p1=${3:-}; p2=${4:-}
-      [[ "$p1" =~ ^[0-9]+$ && "$p2" =~ ^[0-9]+$ ]] || { echo "usage: rapl set <mode> PL1 PL2"; return 2; }
+      rapl_num "$p1" && rapl_num "$p2" || { echo "usage: rapl set <mode> PL1 PL2"; return 2; }
+      p1=$((10#$p1)); p2=$((10#$p2))
       [ "$p1" -ge 5 ] || { echo "Sustained limit must be at least 5 W"; return 3; }
       [ "$p2" -ge "$p1" ] || { echo "Boost limit must be at least the sustained limit"; return 3; }
       [ "$p1" -le "${d% *}" ] && [ "$p2" -le "${d#* }" ] || { echo "Above the firmware default"; return 3; }
@@ -434,6 +472,7 @@ cmd_auto() {
     cfg_set "auto_pending_$src" ""
     local flag; [ "$src" = ac ] && flag=-a || flag=-b
     run asusctl profile set "$flag" "$p" >/dev/null || return 1
+    rapl_apply_for "$(perf_mode)"
   else
     cfg_set "auto_pending_$src" "$p"
   fi
@@ -847,9 +886,17 @@ apply_policy() {
   fi
 }
 
+# Custom CPU limits follow the mode however it was switched (Fn+F5, asusctl,
+# rog-control-center), not only through rogctl.
+rapl_follow() {
+  [ -n "$(rapl_script_for "$1")" ] || return 0
+  log "$1: re-applying CPU power limits"; ask_widget rapl:apply
+}
+
 cmd_watch() {
   command -v udevadm >/dev/null || { log "udevadm missing"; exit 1; }
   apply_policy
+  local perf lastperf; lastperf=$(perf_mode); rapl_follow "$lastperf"
   exec 3< <(udevadm monitor --udev --subsystem-match=power_supply 2>/dev/null)
   local last; last=$(ac_online)
   while :; do
@@ -860,8 +907,13 @@ cmd_watch() {
     local now; now=$(ac_online)
     if [ "$now" != "$last" ] || [ $rc -gt 128 ]; then
       # on AC change act at once; on the 60 s timeout re-assert (config reloads, deferred Eco)
-      apply_policy; [ "$now" != "$last" ] && on_power_change "$now"; last=$now
+      apply_policy
+      # on_power_change already sees to the limits of the new profile
+      if [ "$now" != "$last" ]; then on_power_change "$now"; lastperf=$(perf_mode); fi
+      last=$now
     fi
+    perf=$(perf_mode)
+    if [ "$perf" != "$lastperf" ]; then lastperf=$perf; rapl_follow "$perf"; fi
   done
 }
 
