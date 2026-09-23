@@ -64,9 +64,14 @@ cfg_set() {
   [ "$(cfg_get "$1")" = "$2" ] && return 0
   [ "$DRY" = 1 ] && { printf 'dry-run: set %s=%s in %s\n' "$1" "$2" "$STATE_FILE" >&9; return 0; }
   mkdir -p "$CONF_DIR"
-  local tmp; tmp=$(mktemp "$CONF_DIR/.state.XXXXXX")
+  # The watcher and panel-launched runs can overlap: serialise the rewrite.
+  local lk tmp
+  exec {lk}>"$CONF_DIR/.lock"
+  flock -w 5 "$lk" || log "state lock busy, writing anyway"
+  tmp=$(mktemp "$CONF_DIR/.state.XXXXXX")
   { [ -f "$STATE_FILE" ] && grep -v "^$1=" "$STATE_FILE"; printf '%s=%s\n' "$1" "$2"; } >"$tmp"
   mv "$tmp" "$STATE_FILE"
+  exec {lk}>&-
 }
 
 # ── hardware discovery ─────────────────────────────────────────────────────────
@@ -81,7 +86,8 @@ ac_online() {
   echo 0
 }
 
-# PCI path of the NVIDIA dGPU, empty when it is powered off (dgpu_disable=1).
+# PCI path of the NVIDIA dGPU. It usually stays enumerated in Eco (D3cold, no
+# driver bound); empty only when the firmware has removed it.
 dgpu_dev() {
   local d
   for d in /sys/bus/pci/devices/*; do
@@ -147,6 +153,24 @@ dgpu_holders() {
     while read -r pid; do rd "/proc/$pid/comm"; echo; done | sort -u | paste -sd, - | sed 's/,/, /g'
 }
 
+# Why the dGPU can't be switched off live, empty when it is safe. Fails closed:
+# fuser can't see root-owned holders (nvidia-powerd, nvidia-persistenced), so
+# an awake driver or a running NVIDIA daemon also counts as busy.
+dgpu_busy() {
+  local dev h s
+  dev=$(dgpu_dev)
+  [ -n "$dev" ] || return 0
+  command -v fuser >/dev/null || { echo "Can't check what uses the dGPU (fuser from psmisc is missing)"; return; }
+  if [ -e "$dev/driver" ] && [ "$(rd "$dev/power/runtime_status")" != suspended ]; then
+    echo "The dGPU is awake"; return
+  fi
+  for s in nvidia-powerd nvidia-persistenced; do
+    systemctl is-active -q "$s.service" 2>/dev/null && { echo "$s is running"; return; }
+  done
+  h=$(dgpu_holders)
+  [ -n "$h" ] && echo "The dGPU is open in $h"
+}
+
 # ── status ─────────────────────────────────────────────────────────────────────
 
 cmd_status() {
@@ -161,10 +185,15 @@ cmd_status() {
   echo "epp=$(rd /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference)"
 
   dev=$(dgpu_dev)
-  if [ -n "$dev" ]; then rt=$(rd "$dev/power/runtime_status" unknown); else rt=off; fi
+  # runtime_status only means something with a driver bound; without one, the
+  # cached power_state says whether it is off (reading it does not wake it).
+  if [ -z "$dev" ]; then rt=off
+  elif [ -e "$dev/driver" ]; then rt=$(rd "$dev/power/runtime_status" unknown)
+  elif [ "$(rd "$dev/power_state")" = D3cold ]; then rt=off
+  else rt=unbound; fi
   dis=$(rd "$FA/dgpu_disable/current_value")
   mux=$(rd "$FA/gpu_mux_mode/current_value")
-  pend=$(rd "$FA/pending_reboot/current_value" 0)
+  pend=$(rd "$FA/pending_reboot" 0)
   echo "dgpu=$rt"
   echo "dgpu_disable=$dis"
   echo "mux=$mux"
@@ -685,19 +714,19 @@ armoury() { run asusctl armoury set "$1" "$2" >/dev/null 2>&1 || { [ "$DRY" = 1 
 # dGPU off, live. Refuses when something holds the dGPU; with $1=defer it
 # queues the switch for the next login instead.
 gpu_eco() {
-  local holders
+  local busy
   if [ "$(booted_ultimate)" = 1 ] || [ "$(rd "$FA/gpu_mux_mode/current_value")" = 0 ]; then
     echo "Leave Ultimate first"; return 3
   fi
   [ "$(rd "$FA/dgpu_disable/current_value")" = 1 ] && return 0
-  holders=$(dgpu_holders)
-  if [ -n "$holders" ]; then
+  busy=$(dgpu_busy)
+  if [ -n "$busy" ]; then
     if [ "${1:-}" = defer ]; then
       cfg_set pending_gpu eco
-      echo "Switches at next login. The dGPU is open in $holders"
+      echo "Switches at next login. $busy"
       return 0
     fi
-    echo "The dGPU is open in $holders"; return 3
+    echo "$busy"; return 3
   fi
   armoury dgpu_disable 1
 }
@@ -709,6 +738,14 @@ gpu_standard() {
   if [ "$(rd "$FA/dgpu_disable/current_value")" = 1 ]; then
     armoury dgpu_disable 0 || return 1           # re-enabling is safe live
   fi
+}
+
+# Optimized only ever toggles dgpu_disable. If the MUX went to Ultimate behind
+# our back (asusctl, BIOS), the flag is stale: drop it rather than undo that.
+optimized_stale() {
+  [ "$(rd "$FA/gpu_mux_mode/current_value")" = 0 ] || return 1
+  log "MUX is in Ultimate: clearing Optimized"
+  cfg_set optimized 0
 }
 
 cmd_gpu() {
@@ -727,8 +764,13 @@ cmd_gpu() {
       fi
       cfg_set optimized 1; cfg_set pending_gpu ""
       sync_units
-      if [ "$(ac_online)" = 1 ]; then gpu_standard; else
-        local msg; msg=$(gpu_eco defer); [ -n "$msg" ] && echo "$msg"
+      if [ "$(ac_online)" = 1 ]; then
+        [ "$(rd "$FA/dgpu_disable/current_value")" = 1 ] && { armoury dgpu_disable 0 || return 1; }
+        return 0
+      else
+        local msg rc; msg=$(gpu_eco defer); rc=$?
+        [ -n "$msg" ] && echo "$msg"
+        return $rc
       fi ;;
     ultimate)
       cfg_set optimized 0; cfg_set pending_gpu ""
@@ -763,7 +805,7 @@ cmd_refresh() {
     low|max) cfg_set screen_auto 0; set_refresh "$1"; local rc=$?; sync_units; return $rc ;;
     auto)
       cfg_set screen_auto 1; sync_units
-      [ "$(ac_online)" = 1 ] && set_refresh max || set_refresh low ;;
+      if [ "$(ac_online)" = 1 ]; then set_refresh max; else set_refresh low; fi ;;
     *) echo "usage: refresh low|max|auto"; return 2 ;;
   esac
 }
@@ -786,7 +828,7 @@ cmd_kbd() {
 
 apply_policy() {
   local ac; ac=$(ac_online)
-  if [ "$(cfg_get optimized)" = 1 ]; then
+  if [ "$(cfg_get optimized)" = 1 ] && ! optimized_stale; then
     if [ "$ac" = 1 ]; then
       [ "$(rd "$FA/dgpu_disable/current_value")" = 1 ] && { log "AC: enabling dGPU"; armoury dgpu_disable 0; }
       cfg_set pending_gpu ""
@@ -797,7 +839,7 @@ apply_policy() {
     fi
   fi
   if [ "$(cfg_get screen_auto)" = 1 ]; then
-    [ "$ac" = 1 ] && set_refresh max || set_refresh low
+    if [ "$ac" = 1 ]; then set_refresh max; else set_refresh low; fi
   fi
 }
 
@@ -839,8 +881,12 @@ on_power_change() {
 
 cmd_login_hook() {
   local pend; pend=$(cfg_get pending_gpu)
-  if [ "$(cfg_get optimized)" = 1 ]; then
-    if [ "$(ac_online)" = 1 ]; then gpu_standard; else pend=eco; fi
+  if [ "$(cfg_get optimized)" = 1 ] && ! optimized_stale; then
+    if [ "$(ac_online)" = 1 ]; then
+      [ "$(rd "$FA/dgpu_disable/current_value")" = 1 ] && armoury dgpu_disable 0
+    else
+      pend=eco
+    fi
   fi
   if [ "$pend" = eco ] && [ "$(rd "$FA/gpu_mux_mode/current_value")" = 1 ]; then
     armoury dgpu_disable 1 && log "login: dGPU off"
@@ -872,5 +918,5 @@ case "${1:-}" in
   holders) dgpu_holders ;;
   watch) cmd_watch ;;
   login-hook) cmd_login_hook ;;
-  *) sed -n '2,33p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,/^[^#]/s/^# \{0,1\}//p' "$SELF"; exit 2 ;;
 esac
