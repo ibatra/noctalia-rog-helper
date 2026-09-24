@@ -14,7 +14,7 @@
 #   awakectl toggle                        start (last kind/duration) or stop
 #   awakectl sync                          reconcile the watcher unit with config
 #   awakectl power-key                     run the configured power-key action
-#   awakectl watch                         rog-helper-awake.service body
+#   awakectl watch [--once]                rog-helper-awake.service body (--once: one pass)
 #
 # Dry run: --dry-run, ROG_DRY_RUN=1, or touch ~/.config/rog-helper/dry-run.
 # Exit codes: 0 ok, 2 bad usage, 3 blocked (message on stdout), 1 failed.
@@ -60,6 +60,12 @@ cfg_get() { local v; if [ -f "$CONF" ] && v=$(grep -m1 "^$1=" "$CONF"); then pri
 cfg_set() {
   [ "$(cfg_get "$1")" = "$2" ] && return 0
   [ "$DRY" = 1 ] && { printf 'dry-run: set %s=%s in %s\n' "$1" "$2" "$CONF" >&9; return 0; }
+  cfg_set_real "$1" "$2"
+}
+# cfg_set that ignores dry run. Only for state bookkeeping (a session the
+# watcher ended), never for a setting.
+cfg_set_real() {
+  [ "$(cfg_get "$1")" = "$2" ] && return 0
   mkdir -p "$CONF_DIR"
   # The watcher and panel-launched runs can overlap: serialise the rewrite.
   local lk tmp
@@ -260,11 +266,279 @@ cmd_status() {
   printf 'has_power_key_bind=%s\n' "$hpb"
 }
 
+# ── watcher ────────────────────────────────────────────────────────────────────
+#
+# rog-helper-awake.service. Each pass reads config and sensors, runs decide and
+# makes the machine match: one systemd-inhibit child per held lock, the panel
+# turned off (or disabled) only while the lid is closed, sessions ended with a
+# notification, and a suspend backstop. `watch --once` is one pass, for tests.
+
+AWAKE_INHIBIT=${AWAKE_INHIBIT:-systemd-inhibit}
+AWAKE_NOTIFY=${AWAKE_NOTIFY:-noctalia msg notification-show}
+AWAKE_SUSPEND=${AWAKE_SUSPEND:-systemctl suspend}
+LOCK_KINDS="idle sleep lid"   # take and drop in this order: lid always goes last
+
+declare -A PID=()
+SCREEN_DPMS=0 SCREEN_DPMS_EDP= SCREEN_DISABLED=
+EXT_SINCE= HOT_SINCE= SUSPEND_SINCE= RESUMED_AT= LAST_PASS=
+PREV_AC= PREV_LID= ENDED= TEMP= UDEV_PID= CLEANED=0 FIRST_PASS=1
+
+why_for() {
+  case "$1" in
+    idle) printf 'Screen on session: no screen-off, lock or sleep' ;;
+    sleep) printf 'Awake session: no sleep' ;;
+    lid) printf 'Lid rule: stays awake with the lid closed' ;;
+  esac
+}
+
+lock_take() {
+  local what mode
+  case "$1" in
+    idle) what=idle mode=block ;;           # Noctalia's idle timers ignore block-weak
+    sleep) what=sleep mode=block-weak ;;
+    lid) what=handle-lid-switch mode=block-weak ;;
+  esac
+  if [ "$DRY" = 1 ]; then printf 'dry-run: inhibit %s on\n' "$1" >&9; PID[$1]=dry; return 0; fi
+  # the child keeps only stderr (the journal), so it can't hold a caller's pipe or fd 3/9
+  $AWAKE_INHIBIT --no-ask-password --who="ROG helper" --why="$(why_for "$1")" \
+    --what="$what" --mode="$mode" sleep infinity </dev/null >/dev/null 3<&- 9>&- &
+  PID[$1]=$!
+  log "$1 lock taken"
+}
+
+lock_drop() {
+  local p=${PID[$1]:-}
+  [ -n "$p" ] || return 0
+  unset "PID[$1]"
+  if [ "$p" = dry ]; then printf 'dry-run: inhibit %s off\n' "$1" >&9; return 0; fi
+  kill "$p" 2>/dev/null; wait "$p" 2>/dev/null
+  log "$1 lock dropped"
+}
+
+sync_locks() {
+  local k w
+  # a child that died (refused, killed from outside) holds nothing: take it again
+  for k in $LOCK_KINDS; do
+    [ -n "${PID[$k]:-}" ] && [ "${PID[$k]}" != dry ] || continue
+    kill -0 "${PID[$k]}" 2>/dev/null && continue
+    log "$k lock was lost"; wait "${PID[$k]}" 2>/dev/null; unset "PID[$k]"
+  done
+  for k in $LOCK_KINDS; do w=W_$k; [ "${!w}" = 1 ] && [ -z "${PID[$k]:-}" ] && lock_take "$k"; done
+  for k in $LOCK_KINDS; do w=W_$k; [ "${!w}" = 1 ] || lock_drop "$k"; done
+}
+
+held_list() { local k out=; for k in $LOCK_KINDS; do [ -n "${PID[$k]:-}" ] && out+=${out:+,}$k; done; printf '%s' "$out"; }
+
+# Locks left by a watcher that died without its trap (SIGKILL, crash).
+reap_stale() {
+  [ "$DRY" = 1 ] && return 0
+  [ "$AWAKE_INHIBIT" = systemd-inhibit ] || return 0
+  local p ours=" ${PID[*]} "
+  for p in $(systemd-inhibit --list --json=short 2>/dev/null |
+             jq -r --argjson uid "$(id -u)" '.[] | select(.who=="ROG helper" and .uid==$uid) | .pid' 2>/dev/null); do
+    case "$ours" in *" $p "*) continue ;; esac
+    log "dropping a stale lock (pid $p)"; kill "$p" 2>/dev/null
+  done
+}
+
+notify() { run $AWAKE_NOTIFY "ROG helper" "$1" >/dev/null; }
+
+# ── watcher: screen ──
+
+edp_lit() {  # the eDP's name while its panel is on
+  "$HYPRCTL" monitors -j 2>/dev/null |
+    jq -r 'first(.[] | select((.name|startswith("eDP")) and .dpmsStatus == true) | .name) // empty' 2>/dev/null
+}
+dpms() { run "$HYPRCTL" dispatch "hl.dsp.dpms({ action = \"$1\", monitor = \"$2\" })" >/dev/null; }
+
+screen_enable() {  # undo a disable, with the full monitor rule
+  [ -n "$SCREEN_DISABLED" ] || return 0
+  run "$HYPRCTL" eval "hl.monitor({ output = \"$SCREEN_DISABLED\", mode = \"preferred\", position = \"auto\", scale = 1.25, disabled = false })" >/dev/null
+  log "screen: $SCREEN_DISABLED enabled"; SCREEN_DISABLED=
+}
+screen_light() {  # undo our DPMS off
+  [ "$SCREEN_DPMS" = 1 ] || return 0
+  dpms on "$SCREEN_DPMS_EDP"
+  log "screen: $SCREEN_DPMS_EDP on"; SCREEN_DPMS=0 SCREEN_DPMS_EDP=
+}
+screen_state() {
+  if [ -n "$SCREEN_DISABLED" ]; then printf disable
+  elif [ "$SCREEN_DPMS" = 1 ]; then printf dpms
+  else printf on; fi
+}
+
+# Only ever touches the panel with the lid closed, or to undo what it did.
+# Never reloads Hyprland.
+apply_screen() {
+  local edp
+  [ "$W_screen" != disable ] && screen_enable   # lid open, monitor gone, or setting changed
+  case "$W_screen" in
+    on) screen_light ;;
+    dpms)
+      # checked every pass: an all-monitor DPMS on (Noctalia's idle resume) relights it
+      edp=$(edp_lit)
+      if [ -n "$edp" ]; then dpms off "$edp"; SCREEN_DPMS=1 SCREEN_DPMS_EDP=$edp; log "screen: $edp off"; fi ;;
+    disable)
+      # never the only output, and only once the external one has settled
+      if [ -z "$SCREEN_DISABLED" ] && [ "$I_ext" = 1 ] && [ -n "$EXT_SINCE" ] && [ $(( I_now - EXT_SINCE )) -ge 2 ]; then
+        edp=$(edp_name)
+        if [ -n "$edp" ]; then
+          run "$HYPRCTL" eval "hl.monitor({ output = \"$edp\", disabled = true })" >/dev/null
+          SCREEN_DISABLED=$edp; log "screen: $edp disabled"
+        fi
+      fi ;;
+  esac
+  if [ "$W_lock" = 1 ] && [ "$I_lid" = closed ] && [ "$PREV_LID" = open ]; then
+    run noctalia msg session lock >/dev/null
+  fi
+}
+
+# ── watcher: passes ──
+
+read_inputs() {
+  I_now=$(now)
+  I_ac=$(ac_online); I_lid=$(lid_state); I_bat=$(battery_pct); I_ext=$(external_connected)
+  TEMP=$(pkg_temp_c)
+  I_prev_ac=${PREV_AC:-$I_ac}
+  PREV_LID=${PREV_LID:-$I_lid}
+  if [ -n "$TEMP" ] && [ "$TEMP" -ge "${C_hot_c:-95}" ]; then HOT_SINCE=${HOT_SINCE:-$I_now}; else HOT_SINCE=; fi
+  I_hot=0
+  if [ -n "$HOT_SINCE" ] && [ $(( I_now - HOT_SINCE )) -ge 60 ]; then I_hot=1; fi
+  if [ "$I_ext" = 1 ]; then EXT_SINCE=${EXT_SINCE:-$I_now}; else EXT_SINCE=; fi
+  # a wall-clock jump between passes is a resume from suspend
+  if [ -n "$LAST_PASS" ] && [ $(( I_now - LAST_PASS )) -gt 20 ]; then RESUMED_AT=$I_now; log "resumed"; fi
+  LAST_PASS=$I_now
+}
+
+end_session() {  # end_session REASON; bookkeeping is written even in dry run
+  cfg_set_real session none
+  cfg_set_real until ""
+  C_session=none C_until=
+  ENDED=$1@$I_now
+  log "session ended: $1"
+  case "$1" in
+    time) notify "Awake ended: time's up" ;;
+    battery) notify "Awake ended: battery at ${I_bat}%" ;;
+    unplug) notify "Awake ended: unplugged" ;;
+    hot) notify "Sleeping: CPU at ${TEMP} °C with the lid shut on battery" ;;
+  esac   # boot: silent
+}
+
+# The battery floor and the heat stop also end lid-closed stay-awake on battery
+# without a session. Say why before the lid lock goes and the laptop sleeps.
+notify_lid_stop() {
+  [ -n "${PID[lid]:-}" ] && [ "$W_lid" = 0 ] && [ "$I_lid" = closed ] && [ "$I_ac" = 0 ] || return 0
+  if [ "$C_stop_hot" = 1 ] && [ "$I_hot" = 1 ]; then
+    notify "Sleeping: CPU at ${TEMP} °C with the lid shut on battery"
+  elif [ -n "$I_bat" ] && [ "${C_stop_battery:-0}" -gt 0 ] && [ "$I_bat" -lt "$C_stop_battery" ]; then
+    notify "Sleeping: battery at ${I_bat}% with the lid shut"
+  fi
+}
+
+# Review Focus 1: logind suspends as soon as the lid lock goes; this is the backstop.
+suspend_fallback() {
+  if [ "$W_suspend" != 1 ]; then SUSPEND_SINCE=; return 0; fi
+  SUSPEND_SINCE=${SUSPEND_SINCE:-$I_now}
+  if [ $(( I_now - SUSPEND_SINCE )) -ge 10 ] && [ $(( I_now - RESUMED_AT )) -ge 30 ]; then
+    log "lid closed and nothing keeps the machine up, but it is still awake: suspending"
+    run $AWAKE_SUSPEND
+    SUSPEND_SINCE=
+  fi
+}
+
+write_status() {
+  mkdir -p "$CONF_DIR"
+  local tmp
+  tmp=$(mktemp "$CONF_DIR/.awake.status.XXXXXX") || return 0
+  printf 'held=%s\nwhy=%s\nscreen=%s\nended=%s\nupdated=%s\n' \
+    "$(held_list)" "$W_why" "$(screen_state)" "$ENDED" "$(now)" >"$tmp"
+  mv "$tmp" "$STATUS"
+}
+
+watch_pass() {
+  load_config
+  read_inputs
+  decide
+  if [ -n "$W_end" ]; then end_session "$W_end"; decide
+  else notify_lid_stop; fi
+  sync_locks
+  # after the first take, so a stale lock we replace never leaves a gap
+  if [ "$FIRST_PASS" = 1 ]; then reap_stale; FIRST_PASS=0; fi
+  apply_screen
+  suspend_fallback
+  write_status
+  PREV_AC=$I_ac PREV_LID=$I_lid
+}
+
+# A session doesn't survive a reboot (GNOME Caffeine's restore-state=false).
+boot_check() {
+  local cur rec
+  cur=$(rd "$SYS/proc/sys/kernel/random/boot_id")
+  [ -n "$cur" ] || return 0
+  rec=$(cfg_get boot_id)
+  if [ -n "$rec" ] && [ "$rec" != "$cur" ] && [ "$(cfg_get session)" != none ]; then
+    I_now=$(now); end_session boot
+  fi
+  cfg_set boot_id "$cur"
+}
+
+cleanup() {
+  [ "$CLEANED" = 1 ] && return 0
+  CLEANED=1
+  [ -n "$UDEV_PID" ] && kill "$UDEV_PID" 2>/dev/null
+  # the panel first: dropping the lid lock may suspend at once
+  screen_enable; screen_light
+  if [ -z "${AWAKE_KEEP:-}" ]; then
+    local k; for k in $LOCK_KINDS; do lock_drop "$k"; done
+    W_why=
+  fi
+  write_status
+}
+
+cmd_watch() {
+  local once=0
+  case "${1:-}" in
+    --once) once=1 ;;
+    "") ;;
+    *) log "usage: awakectl watch [--once]"; exit 2 ;;
+  esac
+  W_why= W_screen=on
+  RESUMED_AT=$(now)
+  if [ "$once" = 1 ]; then
+    [ -n "${AWAKE_TEST_SUSPEND_AFTER:-}" ] && SUSPEND_SINCE=$AWAKE_TEST_SUSPEND_AFTER
+    [ -n "${AWAKE_TEST_RESUMED_AT:-}" ] && RESUMED_AT=$AWAKE_TEST_RESUMED_AT
+  fi
+  [ -f "$STATUS" ] && ENDED=$(sed -n 's/^ended=//p' "$STATUS" | tail -n1)
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap : HUP   # not fatal before the loop is up
+  boot_check
+  if [ "$once" = 1 ]; then watch_pass; exit 0; fi
+
+  command -v udevadm >/dev/null || { log "udevadm missing"; exit 1; }
+  # One pipe that udev events and SIGHUP both write into. A trapped signal
+  # doesn't end bash's `read -t`, but a line on fd 3 does. The watcher holds
+  # the write end too, so a dead udevadm shows up through kill -0, not EOF.
+  exec 3<> <(:)   # Linux reopens the /dev/fd pipe read-write: both ends, never EOF
+  udevadm monitor --udev --subsystem-match=power_supply >&3 2>/dev/null </dev/null 9>&- &
+  UDEV_PID=$!
+  trap 'echo hup >&3' HUP   # config changed: every pass re-reads it, so just wake up
+  while :; do
+    watch_pass
+    read -r -t 2 _ <&3
+    # drain the burst of events, then act once
+    while read -r -t 0.2 _ <&3; do :; done
+    kill -0 "$UDEV_PID" 2>/dev/null || { log "udev monitor ended"; exit 1; }
+  done
+}
+
 # ── library guard ──────────────────────────────────────────────────────────────
 
 [ -n "${AWAKE_LIB:-}" ] && return 0 2>/dev/null
 
 case "${1:-}" in
   status) cmd_status ;;
+  watch) shift; cmd_watch "$@" ;;
   *) sed -n '2,/^[^#]/s/^# \{0,1\}//p' "$SELF"; exit 2 ;;
 esac
