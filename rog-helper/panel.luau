@@ -2,13 +2,18 @@
 -- ROG helper panel: G-Helper's one-glance layout in Noctalia's M3 surfaces.
 --
 -- Main view: header (battery, charger, CPU, dGPU), Performance, GPU, Screen,
--- Battery limit, and a row that opens the Power, Fans and Lighting views.
+-- Battery limit, Keyboard, Awake, and a row that opens the Power, Fans,
+-- Lighting and Sleep views.
 --
--- Every read and write goes through bin/rogctl, so the panel holds no hardware
--- logic. A picked option shows as selected straight away and snaps back to the
--- real state on the next snapshot (e.g. a cancelled password prompt).
+-- Every read and write goes through bin/rogctl (bin/awakectl for Sleep & lid,
+-- drawn by awake_view.luau), so the panel holds no hardware logic. A picked
+-- option shows as selected straight away and snaps back to the real state on
+-- the next snapshot (e.g. a cancelled password prompt).
 
-local ROGCTL = (noctalia.pluginDir() or noctalia.expandPath("~/.local/share/noctalia-plugins/rog-helper")) .. "/bin/rogctl"
+local PLUGIN_DIR = noctalia.pluginDir() or noctalia.expandPath("~/.local/share/noctalia-plugins/rog-helper")
+local ROGCTL = PLUGIN_DIR .. "/bin/rogctl"
+local AWAKECTL = PLUGIN_DIR .. "/bin/awakectl"
+local Awake = require("./awake_view.luau")
 local REFRESH_EVERY = 5 -- seconds
 local REFRESH_EXTRA_EVERY = 15 -- seconds, sub-views only (several asusctl calls)
 
@@ -23,7 +28,7 @@ local isOpen = false
 local loading, loadingExtra = false, false
 local reloadAgain, reloadExtraAgain = false, false -- asked for while one was in flight
 
-local view = "main" -- main | power | fans | lighting
+local view = "main" -- main | power | fans | lighting | sleep
 local powerMode = nil -- which mode's CPU limits are being edited
 local drafts = {} -- mode -> { pl1, pl2 } while editing
 local fanProfile = nil -- balanced | performance
@@ -121,14 +126,22 @@ local function refreshExtra()
   end, 8000)
 end
 
-local function act(section, id, args, after)
+-- Sub-views that read rogctl status-extra (Sleep reads awakectl instead).
+local function extraView(v)
+  return v == "power" or v == "fans" or v == "lighting"
+end
+
+-- Runs one command of bin (rogctl or awakectl) for a section: the pick shows
+-- at once, the section is busy until it returns, the outcome becomes a note,
+-- and refreshFn reloads that tool's snapshot.
+local function actWith(bin, refreshFn, section, id, args, after)
   if busy[section] then return end
   busy[section] = true
   picked[section] = id
   setNote(section, nil)
   render()
 
-  local argv = { ROGCTL }
+  local argv = { bin }
   local dry = noctalia.getConfig("dry_run") == true
   if dry then argv[#argv + 1] = "--dry-run" end
   for _, a in ipairs(args) do argv[#argv + 1] = a end
@@ -155,14 +168,22 @@ local function act(section, id, args, after)
       setNote(section, out, "muted", 10)
     end
     -- Only outcomes that need the user to do something become notifications.
-    if res.exitCode == 0 and not dry then
+    if bin == ROGCTL and res.exitCode == 0 and not dry then
       if out:find("next login", 1, true) then notifyAction("Eco switches at your next login") end
       if out == "Restart required" then notifyAction("Restart to finish switching to Ultimate") end
     end
     picked[section] = nil
-    refresh()
-    if after == "extra" or view ~= "main" then refreshExtra() end
+    refreshFn()
+    if after == "extra" or extraView(view) then refreshExtra() end
   end, 60000)
+end
+
+local function act(section, id, args, after)
+  actWith(ROGCTL, refresh, section, id, args, after)
+end
+
+local function actAwake(section, id, args)
+  actWith(AWAKECTL, Awake.refresh, section, id, args)
 end
 
 -- ── derived state ─────────────────────────────────────────────────────────────
@@ -497,7 +518,7 @@ local function navButton(id, glyph, text)
     onClick = function()
       view = id
       hover = ""
-      refreshExtra()
+      if id == "sleep" then Awake.refresh() else refreshExtra() end
       render()
     end,
     onHover = hoverHandler,
@@ -521,11 +542,12 @@ local function mainView()
   return {
     header(),
     ui.column({ gap = 8 }, packed(perfSection(), gpuSection())),
-    ui.column({ gap = 8 }, packed(screenSection(), batterySection(), keyboardSection())),
+    ui.column({ gap = 8 }, packed(screenSection(), batterySection(), keyboardSection(), Awake.mainRow(), noteRow("awake_quick"))),
     ui.row({ gap = 4 }, {
       navButton("power", "gauge", "Power"),
       navButton("fans", "propeller", "Fans"),
       navButton("lighting", "bulb", "Lighting"),
+      navButton("sleep", "moon", "Sleep"),
     }),
   }
 end
@@ -550,6 +572,18 @@ local function toggleRow(title, checked, onChange, detail)
   kids[#kids + 1] = ui.toggle({ checked = checked, onChange = onChange })
   return ui.row({ align = "center", gap = 8 }, kids)
 end
+
+-- The Sleep view and the main-view Awake row are drawn by awake_view.luau from
+-- these blocks; mainView only calls into it at render time, so it can be set
+-- up here, once subHeader and toggleRow exist.
+Awake.setup({
+  choices = choices, iconRow = iconRow, label = label, section = section, toggleRow = toggleRow,
+  subHeader = subHeader, caption = caption, noteRow = noteRow, packed = packed, parse = parse,
+  picked = picked, bin = AWAKECTL,
+  render = function() if isOpen then render() end end,
+  act = actAwake,
+  hover = function() return hover end,
+})
 
 local function loadingView(title)
   return { subHeader(title), caption("Reading…") }
@@ -952,6 +986,7 @@ render = function()
   if view == "power" then body = powerView()
   elseif view == "fans" then body = fansView()
   elseif view == "lighting" then body = lightingView()
+  elseif view == "sleep" then body = Awake.view()
   else body = mainView() end
   if noctalia.getConfig("dry_run") == true then
     table.insert(body, 1, caption("Dry run: buttons only show their commands", "tertiary"))
@@ -999,14 +1034,17 @@ function onOpen(context)
   ticks = 0
   themeHex = readThemeHex()
   st = noctalia.state.get("rog.status") or st
-  if context == "power" or context == "fans" or context == "lighting" then
+  if extraView(context) then
     view = context
     refreshExtra()
+  elseif context == "sleep" then
+    view = context
   else
     view = "main"
   end
   render()
   refresh()
+  Awake.refresh()
   panel.setWantsSecondTicks(true)
 end
 
@@ -1022,10 +1060,11 @@ function update()
   ticks += 1
   if ticks % REFRESH_EVERY == 0 then
     refresh()
+    Awake.refresh() -- the time left, and sessions the watcher ended
   end
   -- external changes (Fn keys, asusctl, rog-control-center) show up in the
   -- sub-views too
-  if view ~= "main" and ticks % REFRESH_EXTRA_EVERY == 0 then
+  if extraView(view) and ticks % REFRESH_EXTRA_EVERY == 0 then
     refreshExtra()
   end
 end
@@ -1033,19 +1072,48 @@ end
 -- Scriptable entry point, also used for testing without a pointer:
 --   noctalia msg plugin ishaan/rog-helper:panel all act gpu:eco
 --   noctalia msg plugin ishaan/rog-helper:panel all view fans
+--   noctalia msg plugin ishaan/rog-helper:panel all act awake:toggle
+-- awake: toggle | stop | start-<system|screen>-<mins|inf> | set-<key>-<value>
 local VERBS = { perf = "perf", gpu = "gpu", screen = "refresh", limit = "limit", kbd = "kbd" }
+-- the awakectl settings `act awake:set-…` may change
+local AWAKE_SETTINGS = {
+  kind = true, mins = true, lid_ac = true, lid_bat = true, lid_screen = true, lid_monitor = true,
+  power_key = true, stop_battery = true, stop_unplug = true, stop_hot = true,
+}
+
+local function awakeIpc(cmd)
+  if cmd == "toggle" then
+    actAwake("awake_quick", "x", { "toggle" })
+  elseif cmd == "stop" then
+    actAwake("awake_quick", "none", { "stop" })
+  else
+    local kind, mins = cmd:match("^start%-(%a+)%-(%w+)$")
+    if kind then
+      actAwake("awake_kind", kind, { "start", kind, mins })
+      return
+    end
+    local key, value = cmd:match("^set%-([%a_]+)%-(%w+)$")
+    if key and AWAKE_SETTINGS[key] then actAwake(key, value, { "set", key .. "=" .. value }) end
+  end
+end
+
 function onIpc(event, payload)
   if type(payload) ~= "string" then return end
   if event == "view" then
     view = payload
-    if view ~= "main" then refreshExtra() end
+    if view == "sleep" then Awake.refresh() elseif extraView(view) then refreshExtra() end
     render()
   elseif event == "tab" then
     lightTab = payload
     render()
   elseif event == "act" then
+    local awakeCmd = payload:match("^awake:(.+)$")
     local sec, id = payload:match("^(%a+):(%w+)$")
-    if sec and VERBS[sec] then act(sec, id, { VERBS[sec], id }) end
+    if awakeCmd then
+      awakeIpc(awakeCmd)
+    elseif sec and VERBS[sec] then
+      act(sec, id, { VERBS[sec], id })
+    end
   elseif event == "run" then
     -- raw rogctl args, space separated (testing): "aura static ffffff"
     local args = {}
