@@ -9,6 +9,9 @@ local PANEL = "ishaan/rog-helper:panel"
 local FA = "/sys/class/firmware-attributes/asus-armoury/attributes/"
 local PP = "/sys/class/platform-profile/"
 
+local PLUGIN_DIR = noctalia.pluginDir() or noctalia.expandPath("~/.local/share/noctalia-plugins/rog-helper")
+local AWAKECTL = PLUGIN_DIR .. "/bin/awakectl"
+
 local GLYPH = { silent = "feather", balanced = "scale", turbo = "rocket" }
 local PERF_LABEL = { silent = "Silent", balanced = "Balanced", turbo = "Turbo" }
 
@@ -19,6 +22,22 @@ local batPath -- resolved once: the first BAT* power supply, with a trailing /
 local function read(path)
   local s = noctalia.readFile(path)
   return s and noctalia.string.trim(s) or nil
+end
+
+local function parseAwake(out)
+  local t = {}
+  for line in (out or ""):gmatch("[^\n]+") do
+    local k, v = line:match("^([%w_]+)=(.*)$")
+    if k then t[k] = v end
+  end
+  return t
+end
+
+-- "1:42" or "42 min" under an hour; ceil so the last minute never reads 0.
+local function awakeDuration(secs)
+  local m = math.ceil(secs / 60)
+  if m < 60 then return m .. " min" end
+  return string.format("%d:%02d", math.floor(m / 60), m % 60)
 end
 
 local function resolveHandler()
@@ -76,8 +95,23 @@ end
 
 local function render()
   local perf = perfMode()
-  barWidget.setGlyph(GLYPH[perf] or "device-laptop")
-  barWidget.setGlyphColor("secondary")
+  local glyphName = GLYPH[perf] or "device-laptop"
+  local awake = noctalia.state.get("rog.awake")
+  local hasSession = type(awake) == "table" and awake.session ~= nil and awake.session ~= "none"
+
+  -- Once render(tree) has been used, setGlyph only warns: always go through
+  -- barWidget.render, even for the plain glyph with no session, so the two
+  -- states never straddle the declarative/imperative split.
+  local container = barWidget.isVertical() and ui.column or ui.row
+  if hasSession then
+    barWidget.render(container({ gap = 0, align = "start" }, {
+      ui.glyph({ name = glyphName, color = "secondary" }),
+      ui.box({ width = 5, height = 5, radius = 3, fill = "primary" }),
+    }))
+  else
+    barWidget.render(container({ align = "start" }, { ui.glyph({ name = glyphName, color = "secondary" }) }))
+  end
+
   local rows = {
     { key = "Performance", value = PERF_LABEL[perf] or "Unknown" },
     { key = "GPU", value = gpuText() },
@@ -85,10 +119,32 @@ local function render()
   batPath = batPath or resolveBattery()
   local limit = batPath and read(batPath .. "charge_control_end_threshold")
   if limit then rows[#rows + 1] = { key = "Battery limit", value = limit .. "%" } end
+
+  if type(awake) == "table" then
+    if hasSession then
+      local value
+      if awake.left == "inf" then
+        value = "until stopped"
+      else
+        local n = tonumber(awake.left or "")
+        value = n and (awakeDuration(n) .. " left") or "until stopped"
+      end
+      rows[#rows + 1] = { key = "Awake", value = value }
+    end
+    if awake.ac == "1" and awake.lid_ac == "awake" then
+      rows[#rows + 1] = { key = "Lid", value = "stays awake on charger" }
+    elseif awake.ac == "0" and awake.lid_bat == "awake" then
+      rows[#rows + 1] = { key = "Lid", value = "stays awake on battery" }
+    end
+  end
   barWidget.setTooltip(rows)
 end
 
 noctalia.state.watch("rog.status", function(_value)
+  render()
+end)
+
+noctalia.state.watch("rog.awake", function(_value)
   render()
 end)
 
@@ -130,9 +186,26 @@ local function sampleDraw()
   noctalia.state.set("rog.draw", copy)
 end
 
+-- Publishes `rog.awake` for the panel's Sleep view and the Control Center
+-- tile, at most once per 9 s across every bar instance: the shared
+-- `rog.awakeAt` timestamp, same pattern as `rog.drawAt` above.
+local function refreshAwake()
+  local now = noctalia.nowMs()
+  local last = noctalia.state.get("rog.awakeAt")
+  if type(last) == "number" and now - last < 9000 then return end
+  noctalia.state.set("rog.awakeAt", now)
+  noctalia.runAsync({ AWAKECTL, "status" }, function(res)
+    if res.exitCode == 0 then
+      noctalia.state.set("rog.awake", parseAwake(res.stdout))
+    end
+    render()
+  end, 5000)
+end
+
 function update()
   noctalia.setUpdateInterval(10000)
   sampleDraw()
+  refreshAwake()
   render()
 end
 
@@ -160,6 +233,13 @@ end
 
 syncDryRunFlag()
 
+-- So the watcher unit exists (or is reconciled with config) right after
+-- install, without waiting for the panel to open or the Control Center tile
+-- to be clicked. Skipped in dry-run so it never touches real systemd units.
+if noctalia.getConfig("dry_run") ~= true then
+  noctalia.runAsync({ AWAKECTL, "sync" }, function() end, 10000)
+end
+
 function onConfigChanged()
   syncDryRunFlag()
 end
@@ -168,7 +248,7 @@ end
 -- prompt from a user service, so it asks this widget, which runs inside the
 -- session:  noctalia msg plugin ishaan/rog-helper:bar focused act perf:silent
 -- A trailing ":dry" means the watcher itself is in dry-run mode.
-local ROGCTL = (noctalia.pluginDir() or noctalia.expandPath("~/.local/share/noctalia-plugins/rog-helper")) .. "/bin/rogctl"
+local ROGCTL = PLUGIN_DIR .. "/bin/rogctl"
 local ACTIONS = { ["perf:silent"] = { "perf", "silent" }, ["rapl:apply"] = { "rapl-apply" } }
 local BUSY = "rog.bgBusy" -- shared by every instance, so only one acts
 function onIpc(event, payload)

@@ -31,6 +31,75 @@ backlight, charge limit, CPU power limits, CPU boost, fan curves, Aura, Slash, b
 hidden. Only the GU606AW has been tested, so other models may still show a control that does
 nothing.
 
+## Sleep & lid
+
+A caffeinate-style "Stay awake" session, plus lid, power-key and stop rules, live in a **Sleep**
+sub-view of the panel (the moon icon next to Power, Fans and Lighting) and on a **☕ Awake** row on
+the main view. The bar glyph gets a small dot while a session is running.
+
+- **Normal / System / Screen on**: Normal is no session. System means the machine doesn't sleep,
+  and the screen still turns off and locks on Noctalia's timers. Screen on means no screen-off, no
+  lock, no sleep. Picking System or Screen on starts a session for the chosen **For** duration
+  (30m / 1h / 2h / 4h / ∞); changing **For** during a session restarts the timer from now.
+- **Lid closed**, set separately for on charger and on battery: Sleep, Stay awake, or (on battery)
+  While awake, which keeps the lid-closed laptop up only while a session is running. On charger
+  defaults to Stay awake, which matches what `20-lid.conf` did; on battery it defaults to Sleep.
+- **Screen** (while the lid is closed and the machine stays up): Off turns the internal panel off
+  with DPMS; Off + lock also locks the session.
+- **With monitor**, shown only with an external output connected: Turn off (DPMS; the default and
+  the safe choice) or Move windows (disables the internal panel so its workspaces move to the
+  external monitor; experimental on this Hyprland build).
+- **Power button**: what a short press does. Nothing is the default and matches today; the other
+  choices are Lock, Sleep, or Menu (Noctalia's session panel). A long press still means poweroff; a
+  press within 5 s of waking from suspend is always ignored.
+- **Stop when**: these end a session (and lid-closed stay-awake on battery, which then lets the
+  laptop sleep) — battery below a percentage (default 20%, 0 = off), unplugged (default off), or
+  hot: the CPU package at or above 95 °C for 60 s with the lid closed on battery (default on).
+  Every stop sends a notification saying why.
+
+### Power key
+
+The press that wakes the machine also reaches logind as a power-key press, which used to power it
+straight back off. `HandlePowerKey=ignore` in `logind.conf` must stay as it is — it's what hands
+the key to Hyprland instead of letting logind act on it — and one bind picks it up from there. Add
+to `~/.config/hypr/config/binds.lua`:
+
+```lua
+hl.bind("XF86PowerOff", hl.dsp.exec_cmd("~/.local/share/noctalia-plugins/rog-helper/bin/awakectl power-key"), { locked = true })
+```
+
+### Taking over from `20-lid.conf`
+
+Once the watcher is running with "On charger" set to Stay awake, the old lid override is
+redundant. Remove it once (needs sudo):
+
+```sh
+sudo rm /etc/systemd/logind.conf.d/20-lid.conf && sudo systemctl kill -s HUP systemd-logind
+```
+
+### Locks
+
+Every idle, sleep or lid lock the plugin holds shows in `systemd-inhibit --list` as `ROG helper`.
+
+### Control Center tile
+
+Add a "Stay awake" tile to Noctalia's Control Center yourself:
+
+```toml
+[[control_center.shortcuts]]
+type = "ishaan/rog-helper:awake"
+```
+
+Click toggles the last-used session; right-click opens the panel's Sleep view.
+
+### Keybind
+
+Bind any key to toggle Stay awake without opening the panel:
+
+```sh
+~/.local/share/noctalia-plugins/rog-helper/bin/awakectl toggle
+```
+
 ## Requirements
 
 - Noctalia 5.1+ (plugin API 30)

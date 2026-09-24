@@ -1,9 +1,14 @@
 # ROG helper - a G-Helper-style control panel for ASUS ROG laptops.
 #
-# bar   -> glyph for the current performance mode; click opens the panel.
+# bar   -> glyph for the current performance mode, with a small dot while a
+#          Sleep & lid session is running; click opens the panel.
 #          Reads sysfs directly every 10 s (no subprocess, never wakes the dGPU).
-# panel -> Performance / GPU / Screen / Battery limit / Keyboard rows. Every
-#          action goes through bin/rogctl (asusctl, powerprofilesctl, hyprctl).
+# panel -> Performance / GPU / Screen / Battery limit / Keyboard rows, plus a
+#          Sleep view (lid rules, the power key, stop conditions). Every
+#          action goes through bin/rogctl (bin/awakectl for Sleep & lid):
+#          asusctl, powerprofilesctl, hyprctl, systemd-inhibit.
+# awake -> Control Center tile ("Stay awake"). Click toggles the last
+#          session; right-click opens the panel's Sleep view.
 #
 # Open it with: noctalia msg panel-toggle ishaan/rog-helper:panel
 
@@ -14,7 +19,7 @@ plugin_api = 30
 author = "ishaan"
 license = "MIT"
 dependencies = []
-tags = ["hardware", "asus", "power", "gpu"]
+tags = ["hardware", "asus", "power", "gpu", "sleep"]
 icon = "device-laptop"
 description = "G-Helper-style performance, GPU, screen, battery and keyboard controls for ASUS ROG laptops."
 
@@ -38,3 +43,7 @@ height = 432
 placement = "attached"
 position = "auto"
 open_near_click = true
+
+[[shortcut]]
+id = "awake"
+entry = "shortcut.luau"
