@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# awakectl - Sleep & lid backend for the ROG helper Noctalia plugin.
+#
+# A caffeinate-style session (System keeps the machine awake; Screen on also
+# keeps the screen on) plus lid, power-key and heat/battery stop rules. State
+# lives in a key=value config file; a watcher unit turns it into held
+# systemd-inhibit locks, screen actions and session ends, and reports back
+# through a status file.
+#
+#   awakectl status                        key=value config, sensors, watcher state
+#   awakectl set k=v...                    write config keys (validated)
+#   awakectl start system|screen <mins|inf>   begin a session (0 mins = until stopped)
+#   awakectl stop                          end the current session
+#   awakectl toggle                        start (last kind/duration) or stop
+#   awakectl sync                          reconcile the watcher unit with config
+#   awakectl power-key                     run the configured power-key action
+#   awakectl watch                         rog-helper-awake.service body
+#
+# Dry run: --dry-run, ROG_DRY_RUN=1, or touch ~/.config/rog-helper/dry-run.
+# Exit codes: 0 ok, 2 bad usage, 3 blocked (message on stdout), 1 failed.
+
+set -u
+
+DRY=0
+if [ "${1:-}" = "--dry-run" ]; then DRY=1; shift; fi
+[ -n "${ROG_DRY_RUN:-}" ] && DRY=1
+[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/rog-helper/dry-run" ] && DRY=1
+
+SELF=$(readlink -f "$0")
+exec 9>&2   # dry-run notes go here even when a command's output is silenced
+
+log() { printf '%s\n' "$*" >&2; }
+
+# Run a mutating command, or just describe it in dry-run mode.
+run() {
+  if [ "$DRY" = 1 ]; then
+    printf 'dry-run: %s\n' "$*" >&9
+    return 0
+  fi
+  "$@"
+}
+
+rd() { local v; v=$(cat "$1" 2>/dev/null) && printf '%s' "$v" || printf '%s' "${2:-}"; }
+
+CONF_DIR=${AWAKE_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/rog-helper}
+CONF=$CONF_DIR/awake
+STATUS=$CONF_DIR/awake.status
+SYS=${AWAKE_SYSROOT:-}
+HYPRCTL=${AWAKE_HYPRCTL:-hyprctl}
+UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+UNIT=rog-helper-awake.service
+
+now() { printf '%s' "${AWAKE_NOW:-$(date +%s)}"; }
+
+# ── config ─────────────────────────────────────────────────────────────────────
+
+DEFAULTS="session=none kind=system mins=60 until= lid_ac=awake lid_bat=sleep lid_screen=off lid_monitor=dpms power_key=none stop_battery=20 stop_unplug=0 stop_hot=1 hot_c=95 boot_id="
+default_of() { local kv; for kv in $DEFAULTS; do [ "${kv%%=*}" = "$1" ] && { printf '%s' "${kv#*=}"; return; }; done; }
+cfg_get() { local v; if [ -f "$CONF" ] && v=$(grep -m1 "^$1=" "$CONF"); then printf '%s' "${v#*=}"; else default_of "$1"; fi; }
+cfg_set() {
+  [ "$(cfg_get "$1")" = "$2" ] && return 0
+  [ "$DRY" = 1 ] && { printf 'dry-run: set %s=%s in %s\n' "$1" "$2" "$CONF" >&9; return 0; }
+  mkdir -p "$CONF_DIR"
+  # The watcher and panel-launched runs can overlap: serialise the rewrite.
+  local lk tmp
+  exec {lk}>"$CONF_DIR/.awake.lock"
+  flock -w 5 "$lk" || log "config lock busy, writing anyway"
+  tmp=$(mktemp "$CONF_DIR/.awake.XXXXXX")
+  { [ -f "$CONF" ] && grep -v "^$1=" "$CONF"; printf '%s=%s\n' "$1" "$2"; } >"$tmp"
+  mv "$tmp" "$CONF"
+  exec {lk}>&-
+}
+
+load_config() {
+  local kv k
+  for kv in $DEFAULTS; do
+    k=${kv%%=*}
+    printf -v "C_${k}" '%s' "$(cfg_get "$k")"
+  done
+}
+
+# ── validation ─────────────────────────────────────────────────────────────────
+
+valid() {  # valid KEY VALUE
+  case "$1" in
+    session) case "$2" in none|system|screen) return 0 ;; *) return 1 ;; esac ;;
+    kind) case "$2" in system|screen) return 0 ;; *) return 1 ;; esac ;;
+    mins) [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -le 1440 ] ;;
+    until) [[ "$2" =~ ^[0-9]*$ ]] || [ "$2" = inf ] ;;
+    lid_ac) case "$2" in awake|sleep) return 0 ;; *) return 1 ;; esac ;;
+    lid_bat) case "$2" in sleep|session|awake) return 0 ;; *) return 1 ;; esac ;;
+    lid_screen) case "$2" in off|lock) return 0 ;; *) return 1 ;; esac ;;
+    lid_monitor) case "$2" in dpms|disable) return 0 ;; *) return 1 ;; esac ;;
+    power_key) case "$2" in none|lock|sleep|menu) return 0 ;; *) return 1 ;; esac ;;
+    stop_battery) [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -le 50 ] ;;
+    stop_unplug|stop_hot) case "$2" in 0|1) return 0 ;; *) return 1 ;; esac ;;
+    hot_c) [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -ge 70 ] && [ "$2" -le 105 ] ;;
+    boot_id) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ── decide ─────────────────────────────────────────────────────────────────────
+#
+# Pure: no I/O, no subshells, no `date`. Reads C_* (config) and I_* (sensors),
+# writes W_* (what the watcher should do).
+#
+# Inputs:  C_session C_until C_lid_ac C_lid_bat C_lid_screen C_lid_monitor
+#          C_stop_battery C_stop_unplug C_stop_hot
+#          I_ac I_prev_ac I_lid I_bat I_hot I_now I_ext
+# Outputs: W_idle W_sleep W_lid (0/1) W_screen (on|dpms|disable)
+#          W_lock W_suspend (0/1) W_end (empty|time|battery|unplug|hot) W_why
+
+decide() {
+  local session=$C_session low=0 hotlid=0 rule
+  W_end=
+  [ -n "$I_bat" ] && [ "${C_stop_battery:-0}" -gt 0 ] && [ "$I_ac" = 0 ] && [ "$I_bat" -lt "$C_stop_battery" ] && low=1
+  [ "$C_stop_hot" = 1 ] && [ "$I_hot" = 1 ] && [ "$I_lid" = closed ] && [ "$I_ac" = 0 ] && hotlid=1
+  if [ "$session" != none ]; then
+    if [ -n "$C_until" ] && [ "$C_until" != inf ] && [ "$I_now" -ge "$C_until" ]; then W_end=time
+    elif [ "$low" = 1 ]; then W_end=battery
+    elif [ "$C_stop_unplug" = 1 ] && [ "$I_prev_ac" = 1 ] && [ "$I_ac" = 0 ]; then W_end=unplug
+    elif [ "$hotlid" = 1 ]; then W_end=hot
+    fi
+    [ -n "$W_end" ] && session=none
+  fi
+  W_idle=0 W_sleep=0 W_lid=0 W_lock=0 W_suspend=0 W_screen=on W_why=
+  [ "$session" = screen ] && W_idle=1
+  [ "$session" != none ] && W_sleep=1
+  if [ "$I_ac" = 1 ]; then rule=$C_lid_ac; else rule=$C_lid_bat; fi
+  if [ "$rule" = awake ] || { [ "$rule" = session ] && [ "$session" != none ]; }; then W_lid=1; fi
+  # on battery the floor and the heat stop also keep the lid from holding the machine up
+  if [ "$I_ac" = 0 ] && { [ "$low" = 1 ] || [ "$hotlid" = 1 ]; }; then W_lid=0; fi
+  if [ "$I_lid" = closed ]; then
+    if [ "$W_lid" = 1 ] || [ "$I_ext" = 1 ]; then
+      W_screen=dpms
+      [ "$I_ext" = 1 ] && [ "$C_lid_monitor" = disable ] && W_screen=disable
+      [ "$C_lid_screen" = lock ] && W_lock=1
+    else
+      W_suspend=1
+    fi
+  fi
+  local parts=()
+  [ "$session" = screen ] && parts+=("Awake session, screen on")
+  [ "$session" = system ] && parts+=("Awake session")
+  if [ "$W_lid" = 1 ] && [ "$I_lid" = closed ]; then
+    if [ "$I_ac" = 1 ]; then parts+=("lid closed on charger"); else parts+=("lid closed on battery"); fi
+  fi
+  [ "$I_ext" = 1 ] && [ "$I_lid" = closed ] && [ "$W_lid" = 0 ] && parts+=("lid closed with a monitor")
+  local IFS=,; W_why=${parts[*]}; W_why=${W_why//,/ · }
+}
+
+# ── sensors (all prefixed by $SYS, all tolerant of missing files) ─────────────
+
+ac_online() {
+  local f
+  for f in "$SYS"/sys/class/power_supply/A*/online "$SYS"/sys/class/power_supply/*/online; do
+    [ -f "$f" ] || continue
+    [ "$(rd "${f%/online}/type")" = "Mains" ] || continue
+    rd "$f" 0; return
+  done
+  echo 0
+}
+
+lid_state() {
+  local f
+  for f in "$SYS"/proc/acpi/button/lid/*/state; do
+    [ -f "$f" ] || continue
+    case "$(cat "$f" 2>/dev/null)" in *closed*) echo closed; return ;; esac
+  done
+  echo open
+}
+
+battery_pct() {
+  local b; b=$(ls -d "$SYS"/sys/class/power_supply/BAT* 2>/dev/null | sort | head -n1)
+  [ -n "$b" ] && rd "$b/capacity"
+}
+
+pkg_temp_c() {
+  local want z
+  for want in x86_pkg_temp TCPU; do
+    for z in "$SYS"/sys/class/thermal/thermal_zone*; do
+      [ -f "$z/type" ] || continue
+      [ "$(rd "$z/type")" = "$want" ] || continue
+      printf '%s' "$(( $(rd "$z/temp" 0) / 1000 ))"; return
+    done
+  done
+}
+
+edp_name() {
+  "$HYPRCTL" monitors all -j 2>/dev/null | jq -r 'first(.[] | select(.name|startswith("eDP")) | .name) // empty' 2>/dev/null
+}
+
+external_connected() {
+  local f d c
+  for f in "$SYS"/sys/class/drm/card*-*/status; do
+    [ -f "$f" ] || continue
+    d=${f%/status}; d=${d##*/}   # e.g. card1-eDP-1 or card1-DP-3
+    c=${d#card*-}                # strip the "cardN-" prefix -> eDP-1 / DP-3
+    case "$c" in eDP*) continue ;; esac
+    [ "$(cat "$f" 2>/dev/null)" = connected ] && { echo 1; return; }
+  done
+  echo 0
+}
+
+# ── status ─────────────────────────────────────────────────────────────────────
+
+cmd_status() {
+  load_config
+  local ac lid bat temp ext
+  ac=$(ac_online); lid=$(lid_state); bat=$(battery_pct); temp=$(pkg_temp_c); ext=$(external_connected)
+
+  local I_ac=$ac I_prev_ac=$ac I_lid=$lid I_bat=$bat I_hot=0 I_now I_ext=$ext
+  I_now=$(now)
+  [ -n "$temp" ] && [ "$C_stop_hot" = 1 ] && [ "$temp" -ge "${C_hot_c:-95}" ] && I_hot=1
+  decide
+
+  local kv k
+  for kv in $DEFAULTS; do
+    k=${kv%%=*}
+    if [ "$k" = session ] && [ -n "$W_end" ]; then printf 'session=none\n'; else
+      eval "printf '%s=%s\n' '$k' \"\$C_${k}\""
+    fi
+  done
+
+  printf 'ac=%s\n' "$ac"
+  printf 'lid=%s\n' "$lid"
+  printf 'battery=%s\n' "$bat"
+  printf 'temp=%s\n' "$temp"
+  printf 'ext=%s\n' "$ext"
+
+  local left=
+  if [ -n "$W_end" ]; then left=
+  elif [ "$C_session" = none ]; then left=
+  elif [ "$C_until" = inf ]; then left=inf
+  elif [ -n "$C_until" ]; then left=$(( C_until - I_now )); [ "$left" -lt 0 ] && left=0
+  fi
+  printf 'left=%s\n' "$left"
+
+  local held= why= screen= ended= updated=
+  if [ -f "$STATUS" ]; then
+    held=$(sed -n 's/^held=//p' "$STATUS" | tail -n1)
+    why=$(sed -n 's/^why=//p' "$STATUS" | tail -n1)
+    screen=$(sed -n 's/^screen=//p' "$STATUS" | tail -n1)
+    ended=$(sed -n 's/^ended=//p' "$STATUS" | tail -n1)
+    updated=$(sed -n 's/^updated=//p' "$STATUS" | tail -n1)
+  fi
+  printf 'held=%s\n' "$held"
+  printf 'why=%s\n' "$why"
+  printf 'screen=%s\n' "$screen"
+  printf 'ended=%s\n' "$ended"
+  printf 'updated=%s\n' "$updated"
+
+  local watcher=inactive
+  if systemctl --user is-active -q "$UNIT" 2>/dev/null; then watcher=active; fi
+  printf 'watcher=%s\n' "$watcher"
+
+  local hpb=0
+  grep -rqs 'awakectl power-key' ~/.config/hypr 2>/dev/null && hpb=1
+  printf 'has_power_key_bind=%s\n' "$hpb"
+}
+
+# ── library guard ──────────────────────────────────────────────────────────────
+
+[ -n "${AWAKE_LIB:-}" ] && return 0 2>/dev/null
+
+case "${1:-}" in
+  status) cmd_status ;;
+  *) sed -n '2,/^[^#]/s/^# \{0,1\}//p' "$SELF"; exit 2 ;;
+esac
