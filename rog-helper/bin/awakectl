@@ -106,6 +106,9 @@ valid() {  # valid KEY VALUE
   esac
 }
 
+# a setting `set` is allowed to touch, as opposed to a value `valid` rejects for one
+known_key() { local kv; for kv in $DEFAULTS; do [ "${kv%%=*}" = "$1" ] && return 0; done; return 1; }
+
 # ── decide ─────────────────────────────────────────────────────────────────────
 #
 # Pure: no I/O, no subshells, no `date`. Reads C_* (config) and I_* (sensors),
@@ -264,6 +267,133 @@ cmd_status() {
   local hpb=0
   grep -rqs 'awakectl power-key' ~/.config/hypr 2>/dev/null && hpb=1
   printf 'has_power_key_bind=%s\n' "$hpb"
+}
+
+# ── CLI actions ────────────────────────────────────────────────────────────────
+#
+# The commands the panel, widget and Control Center shortcut drive. Every one
+# of them prints nothing on success; a bad `set` prints one sentence and exits
+# 2. Anything that changes what the watcher needs ends in `cmd_sync`.
+
+cmd_set() {
+  [ $# -ge 1 ] || { log "usage: awakectl set k=v [k=v...]"; exit 2; }
+  local kv k v
+  for kv in "$@"; do
+    case "$kv" in *=*) : ;; *) log "usage: awakectl set k=v [k=v...]"; exit 2 ;; esac
+    k=${kv%%=*}; v=${kv#*=}
+    known_key "$k" || { log "Unknown setting $k"; exit 2; }
+    valid "$k" "$v" || { log "Bad value for $k"; exit 2; }
+  done
+  for kv in "$@"; do
+    cfg_set "${kv%%=*}" "${kv#*=}"
+  done
+  cmd_sync
+}
+
+cmd_start() {
+  [ $# -eq 2 ] || { log "usage: awakectl start system|screen <mins|inf|0>"; exit 2; }
+  local kind=$1 arg=$2 mins until
+  valid kind "$kind" || { log "Bad value for kind"; exit 2; }
+  if [ "$arg" = inf ]; then mins=0; else mins=$arg; fi
+  valid mins "$mins" || { log "Bad value for mins"; exit 2; }
+  if [ "$mins" = 0 ]; then until=inf; else until=$(( $(now) + mins * 60 )); fi
+  cfg_set session "$kind"
+  cfg_set kind "$kind"
+  cfg_set mins "$mins"
+  cfg_set until "$until"
+  cmd_sync
+}
+
+cmd_stop() {
+  cfg_set session none
+  cfg_set until ""
+  cmd_sync
+}
+
+cmd_toggle() {
+  if [ "$(cfg_get session)" != none ]; then
+    cmd_stop
+  else
+    cmd_start "$(cfg_get kind)" "$(cfg_get mins)"
+  fi
+}
+
+# ── unit lifecycle ─────────────────────────────────────────────────────────────
+
+unit_text() {
+  cat <<EOF
+# Installed by the ROG helper Noctalia plugin. Holds the idle, sleep and lid
+# locks a session or a stay-awake lid rule needs, and drives the lid screen
+# action. Disabled again when nothing needs it.
+[Unit]
+Description=ROG helper: Sleep & lid (lid, sleep and idle locks)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=$SELF watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+}
+
+write_unit() {
+  mkdir -p "$UNIT_DIR"
+  unit_text >"$UNIT_DIR/$UNIT"
+}
+
+# Reconciles the watcher unit with config: written/rewritten only when its
+# text changed, enabled and (re)signalled while anything needs it, otherwise
+# disabled. Called after every set/start/stop/toggle, and stand-alone.
+cmd_sync() {
+  load_config
+  local need=0
+  { [ "$C_session" != none ] || [ "$C_lid_ac" != sleep ] || [ "$C_lid_bat" != sleep ]; } && need=1
+  if [ "$need" = 1 ]; then
+    if [ "$(unit_text)" != "$(cat "$UNIT_DIR/$UNIT" 2>/dev/null)" ]; then
+      run write_unit
+      run systemctl --user daemon-reload
+    fi
+    run systemctl --user enable -q "$UNIT"
+    if systemctl --user is-active -q "$UNIT" 2>/dev/null; then
+      run systemctl --user kill -s HUP "$UNIT"
+    else
+      run systemctl --user --no-block start "$UNIT"
+    fi
+  elif [ -f "$UNIT_DIR/$UNIT" ]; then
+    run systemctl --user --no-block disable -q --now "$UNIT"
+  fi
+}
+
+# ── power key ──────────────────────────────────────────────────────────────────
+#
+# Bound to XF86PowerOff in Hyprland (HandlePowerKey=ignore hands it to us). The
+# press that wakes the machine from suspend also reaches here, so a press
+# within 5 s of systemd-suspend.service finishing is ignored.
+
+cmd_power_key() {
+  local last=
+  if [ -n "${AWAKE_LAST_RESUME:-}" ]; then
+    last=$AWAKE_LAST_RESUME
+  else
+    local ts
+    ts=$(systemctl show systemd-suspend.service -p ExecMainExitTimestamp --value 2>/dev/null)
+    [ -n "$ts" ] && last=$(date -d "$ts" +%s 2>/dev/null)
+  fi
+  if [ -n "$last" ] && [ $(( $(now) - last )) -lt 5 ]; then
+    log "power key: ignored (just woke)"
+    return 0
+  fi
+  load_config
+  case "$C_power_key" in
+    lock) run noctalia msg session lock >/dev/null ;;
+    sleep) run $AWAKE_SUSPEND ;;
+    menu) run noctalia msg panel-toggle session >/dev/null ;;
+    *) : ;;   # none
+  esac
 }
 
 # ── watcher ────────────────────────────────────────────────────────────────────
@@ -539,6 +669,12 @@ cmd_watch() {
 
 case "${1:-}" in
   status) cmd_status ;;
+  set) shift; cmd_set "$@" ;;
+  start) shift; cmd_start "$@" ;;
+  stop) cmd_stop ;;
+  toggle) cmd_toggle ;;
+  sync) cmd_sync ;;
+  power-key) cmd_power_key ;;
   watch) shift; cmd_watch "$@" ;;
   *) sed -n '2,/^[^#]/s/^# \{0,1\}//p' "$SELF"; exit 2 ;;
 esac
