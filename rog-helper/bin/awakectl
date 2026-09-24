@@ -297,6 +297,10 @@ cmd_start() {
   if [ "$arg" = inf ]; then mins=0; else mins=$arg; fi
   valid mins "$mins" || { log "Bad value for mins"; exit 2; }
   if [ "$mins" = 0 ]; then until=inf; else until=$(( $(now) + mins * 60 )); fi
+  # A session belongs to this boot. The watcher may not have run yet this boot
+  # (both lid rules on Sleep), so its boot check must not take it for a stale one.
+  local boot; boot=$(rd "$SYS/proc/sys/kernel/random/boot_id")
+  [ -n "$boot" ] && cfg_set boot_id "$boot"
   cfg_set session "$kind"
   cfg_set kind "$kind"
   cfg_set mins "$mins"
@@ -359,7 +363,9 @@ cmd_sync() {
     fi
     run systemctl --user enable -q "$UNIT"
     if systemctl --user is-active -q "$UNIT" 2>/dev/null; then
-      run systemctl --user kill -s HUP "$UNIT"
+      # the watcher alone: a HUP to the whole cgroup (kill's default) would
+      # kill its inhibitor children and udevadm, dropping every lock
+      run systemctl --user kill --kill-whom=main -s HUP "$UNIT"
     else
       run systemctl --user --no-block start "$UNIT"
     fi
@@ -371,19 +377,22 @@ cmd_sync() {
 # ── power key ──────────────────────────────────────────────────────────────────
 #
 # Bound to XF86PowerOff in Hyprland (HandlePowerKey=ignore hands it to us). The
-# press that wakes the machine from suspend also reaches here, so a press
-# within 5 s of systemd-suspend.service finishing is ignored.
+# press that wakes the machine from suspend also reaches here. It arrives as
+# soon as userspace thaws, while systemd-suspend.service is still activating
+# (systemd-sleep runs its post-resume hooks before it exits), so a press then,
+# or within 5 s of the unit exiting, is ignored.
 
 cmd_power_key() {
-  local last=
-  if [ -n "${AWAKE_LAST_RESUME:-}" ]; then
-    last=$AWAKE_LAST_RESUME
-  else
-    local ts
-    ts=$(systemctl show systemd-suspend.service -p ExecMainExitTimestamp --value 2>/dev/null)
-    [ -n "$ts" ] && last=$(date -d "$ts" +%s 2>/dev/null)
-  fi
-  if [ -n "$last" ] && [ $(( $(now) - last )) -lt 5 ]; then
+  local kv state= last=
+  while IFS= read -r kv; do
+    case "$kv" in
+      ActiveState=*) state=${kv#*=} ;;
+      ExecMainExitTimestamp=@*) last=${kv#*=@} ;;
+    esac
+  done < <(systemctl show -p ActiveState,ExecMainExitTimestamp --timestamp=unix systemd-suspend.service 2>/dev/null)
+  [[ "$last" =~ ^[0-9]+$ ]] || last=
+  if [ "$state" = activating ] || [ "$state" = deactivating ] ||
+     { [ -n "$last" ] && [ $(( $(now) - last )) -lt 5 ]; }; then
     log "power key: ignored (just woke)"
     return 0
   fi

@@ -283,9 +283,11 @@ Each lock is one `systemd-inhibit --no-ask-password --who="ROG helper" --why=<re
   `hl.bind("XF86PowerOff", hl.dsp.exec_cmd("<pluginDir>/bin/awakectl power-key"), { locked = true })`.
   The implementation checks that Hyprland actually receives `XF86PowerOff` while
   `HandlePowerKey=ignore`. If it doesn't, the row is hidden.
-- `awakectl power-key` ignores the press if systemd-suspend.service finished
-  within the last 5 s (`systemctl show -p ExecMainExitTimestamp`, realtime). It
-  then runs the configured action:
+- `awakectl power-key` ignores the press if systemd-suspend.service is still
+  activating, or finished within the last 5 s (`systemctl show -p
+  ActiveState,ExecMainExitTimestamp --timestamp=unix`). The waking press arrives
+  as soon as userspace thaws, before systemd-sleep's post-resume hooks let the
+  unit exit. Otherwise it runs the configured action:
   - lock: `noctalia msg session lock`
   - sleep: `systemctl suspend`
   - menu: Noctalia's session panel, through its panel id
