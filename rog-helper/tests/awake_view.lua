@@ -101,7 +101,7 @@ local BASE = {
   session = "none", kind = "system", mins = "60", ["until"] = "", lid_ac = "awake", lid_bat = "sleep",
   lid_screen = "off", lid_monitor = "dpms", power_key = "none", stop_battery = "20", stop_unplug = "0",
   stop_hot = "1", ac = "1", lid = "open", battery = "80", left = "", held = "", why = "",
-  has_power_key_bind = "1",
+  has_power_key_bind = "1", ext = "1",
 }
 local function status(over)
   local t = {}
@@ -224,6 +224,22 @@ load({})
 picked.lid_monitor = "disable"
 eq("warning follows a pending pick", "tertiary", (captionText(Awake.view(), WARN) or {}).color)
 picked.lid_monitor = nil
+-- With monitor only shows while an external output is connected
+load({ ext = "0" })
+eq("no monitor row without an external output", nil, row(Awake.view(), "lid_monitor"))
+eq("no monitor glyph without an external output", nil,
+  find(Awake.view(), function(n) return n.bb == "iconRow" and n.glyph == "device-desktop" end))
+load({ ext = "0", lid_monitor = "disable" })
+eq("no warning without an external output", nil, captionText(Awake.view(), WARN))
+eq("other lid rows stay without an external output", "plug", row(Awake.view(), "lid_ac").glyph)
+load({ ext = "0" })
+picked.lid_monitor = "disable"
+eq("a pending monitor pick keeps the row", "device-desktop", (row(Awake.view(), "lid_monitor") or {}).glyph)
+eq("a pending monitor pick keeps the warning", "tertiary", (captionText(Awake.view(), WARN) or {}).color)
+picked.lid_monitor = nil
+load({ ext = "1" })
+eq("monitor row with an external output", "device-desktop", (row(Awake.view(), "lid_monitor") or {}).glyph)
+load({})
 
 -- ── power button ──────────────────────────────────────────────────────────────
 

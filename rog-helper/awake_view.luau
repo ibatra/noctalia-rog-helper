@@ -196,6 +196,8 @@ function Awake.view()
   end)
 
   local monitor = B.picked.lid_monitor or s.lid_monitor
+  -- With monitor only matters with an external output; a pending pick keeps it up until it lands
+  local hasExt = s.ext == "1" or B.picked.lid_monitor ~= nil
   local body = B.packed(
     B.choices("tile", "awake_kind", {
       { id = "none", label = "Normal", glyph = "moon", onClick = function() B.act("awake_kind", "none", { "stop" }) end },
@@ -208,8 +210,8 @@ function Awake.view()
       B.iconRow("plug", setting("lid_ac", { { "sleep", "Sleep" }, { "awake", "Stay awake" } })),
       B.iconRow("battery-2", setting("lid_bat", { { "sleep", "Sleep" }, { "session", "While awake" }, { "awake", "Stay awake" } })),
       B.iconRow("device-laptop-off", setting("lid_screen", { { "off", "Off" }, { "lock", "Off + lock" } })),
-      B.iconRow("device-desktop", setting("lid_monitor", { { "dpms", "Turn off" }, { "disable", "Move windows" } })),
-      monitor == "disable" and B.caption("Experimental on this Hyprland: removing a screen can close apps", "tertiary") or nil,
+      hasExt and B.iconRow("device-desktop", setting("lid_monitor", { { "dpms", "Turn off" }, { "disable", "Move windows" } })) or nil,
+      hasExt and monitor == "disable" and B.caption("Experimental on this Hyprland: removing a screen can close apps", "tertiary") or nil,
     }),
     B.section({
       B.label("Power button"),
