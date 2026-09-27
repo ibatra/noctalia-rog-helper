@@ -9,18 +9,10 @@
 local PLUGIN_DIR = noctalia.pluginDir() or noctalia.expandPath("~/.local/share/noctalia-plugins/rog-helper")
 local AWAKECTL = PLUGIN_DIR .. "/bin/awakectl"
 local PANEL = "ishaan/rog-helper:panel"
+local Common = require("./common.luau")
 
 local snap = noctalia.state.get("rog.awake")
 local loading = false
-
-local function parse(out)
-  local t = {}
-  for line in (out or ""):gmatch("[^\n]+") do
-    local k, v = line:match("^([%w_]+)=(.*)$")
-    if k then t[k] = v end
-  end
-  return t
-end
 
 local function render()
   local session = type(snap) == "table" and snap.session or nil
@@ -38,7 +30,7 @@ local function refresh()
   noctalia.runAsync({ AWAKECTL, "status" }, function(res)
     loading = false
     if res.exitCode == 0 then
-      snap = parse(res.stdout)
+      snap = Common.parse(res.stdout)
       noctalia.state.set("rog.awake", snap)
     end
     render()

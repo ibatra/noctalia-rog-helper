@@ -11,6 +11,7 @@ local PP = "/sys/class/platform-profile/"
 
 local PLUGIN_DIR = noctalia.pluginDir() or noctalia.expandPath("~/.local/share/noctalia-plugins/rog-helper")
 local AWAKECTL = PLUGIN_DIR .. "/bin/awakectl"
+local Common = require("./common.luau")
 
 local GLYPH = { silent = "feather", balanced = "scale", turbo = "rocket" }
 local PERF_LABEL = { silent = "Silent", balanced = "Balanced", turbo = "Turbo" }
@@ -22,22 +23,6 @@ local batPath -- resolved once: the first BAT* power supply, with a trailing /
 local function read(path)
   local s = noctalia.readFile(path)
   return s and noctalia.string.trim(s) or nil
-end
-
-local function parseAwake(out)
-  local t = {}
-  for line in (out or ""):gmatch("[^\n]+") do
-    local k, v = line:match("^([%w_]+)=(.*)$")
-    if k then t[k] = v end
-  end
-  return t
-end
-
--- "1:42" or "42 min" under an hour; ceil so the last minute never reads 0.
-local function awakeDuration(secs)
-  local m = math.ceil(secs / 60)
-  if m < 60 then return m .. " min" end
-  return string.format("%d:%02d", math.floor(m / 60), m % 60)
 end
 
 local function resolveHandler()
@@ -127,7 +112,7 @@ local function render()
         value = "until stopped"
       else
         local n = tonumber(awake.left or "")
-        value = n and (awakeDuration(n) .. " left") or "until stopped"
+        value = n and (Common.duration(n) .. " left") or "until stopped"
       end
       rows[#rows + 1] = { key = "Awake", value = value }
     end
@@ -196,7 +181,7 @@ local function refreshAwake()
   noctalia.state.set("rog.awakeAt", now)
   noctalia.runAsync({ AWAKECTL, "status" }, function(res)
     if res.exitCode == 0 then
-      noctalia.state.set("rog.awake", parseAwake(res.stdout))
+      noctalia.state.set("rog.awake", Common.parse(res.stdout))
     end
     render()
   end, 5000)
@@ -213,25 +198,8 @@ function onClick()
   noctalia.togglePanel(PANEL)
 end
 
--- The plugin's dry_run setting has to reach the systemd units too, and they
--- only see ~/.config/rog-helper/dry-run. The flag is written with a marker, so
--- turning the setting off never removes a flag the user touched by hand.
-local FLAG_MARK = "set by the ROG helper plugin's dry_run setting\n"
-local function syncDryRunFlag()
-  local conf = noctalia.getenv("XDG_CONFIG_HOME") or ""
-  if conf == "" then conf = noctalia.expandPath("~/.config") end
-  local flag = conf .. "/rog-helper/dry-run"
-  if noctalia.getConfig("dry_run") == true then
-    if not noctalia.fileExists(flag) then
-      noctalia.mkdirAll(conf .. "/rog-helper")
-      noctalia.writeFile(flag, FLAG_MARK)
-    end
-  elseif noctalia.fileExists(flag) and noctalia.readFile(flag) == FLAG_MARK then
-    noctalia.removeFile(flag)
-  end
-end
-
-syncDryRunFlag()
+-- The dry_run setting reaches the systemd units through a flag file.
+Common.syncDryRunFlag()
 
 -- So the watcher unit exists (or is reconciled with config) right after
 -- install, without waiting for the panel to open or the Control Center tile
@@ -241,7 +209,7 @@ if noctalia.getConfig("dry_run") ~= true then
 end
 
 function onConfigChanged()
-  syncDryRunFlag()
+  Common.syncDryRunFlag()
 end
 
 -- The power-source watcher (rog-helper-auto.service) can't show a polkit
@@ -266,14 +234,7 @@ function onIpc(event, payload)
   for _, a in ipairs(args) do argv[#argv + 1] = a end
   noctalia.runAsync(argv, function(res)
     noctalia.state.set(BUSY, 0)
-    local cmds = {}
-    for line in (res.stderr or ""):gmatch("[^\n]+") do
-      local c = line:match("^dry%-run: (.*)$")
-      if c then cmds[#cmds + 1] = c end
-    end
-    if dry or #cmds > 0 then
-      noctalia.notify("ROG helper dry run", #cmds > 0 and table.concat(cmds, "\n") or "Nothing to do")
-    end
+    Common.notifyDryRun(res.stderr, dry)
     render()
   end, 60000)
 end

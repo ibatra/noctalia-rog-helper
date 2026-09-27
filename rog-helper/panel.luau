@@ -13,6 +13,7 @@
 local PLUGIN_DIR = noctalia.pluginDir() or noctalia.expandPath("~/.local/share/noctalia-plugins/rog-helper")
 local ROGCTL = PLUGIN_DIR .. "/bin/rogctl"
 local AWAKECTL = PLUGIN_DIR .. "/bin/awakectl"
+local Common = require("./common.luau")
 local Awake = require("./awake_view.luau")
 local REFRESH_EVERY = 5 -- seconds
 local REFRESH_EXTRA_EVERY = 15 -- seconds, sub-views only (several asusctl calls)
@@ -43,14 +44,7 @@ local function num(v) return tonumber(v or "") end
 -- which counts as present so nothing flickers away on open.
 local function has(t, key) return t["has_" .. key] ~= "0" end
 
-local function parse(out)
-  local t = {}
-  for line in (out or ""):gmatch("[^\n]+") do
-    local k, v = line:match("^([%w_]+)=(.*)$")
-    if k then t[k] = v end
-  end
-  return t
-end
+local parse = Common.parse
 
 local function setNote(section, text, tone, seconds)
   if text == nil or text == "" then
@@ -150,14 +144,7 @@ local function actWith(bin, refreshFn, section, id, args, after)
   noctalia.runAsync(argv, function(res)
     busy[section] = nil
     local out = noctalia.string.trim(res.stdout or "")
-    local cmds = {}
-    for line in (res.stderr or ""):gmatch("[^\n]+") do
-      local c = line:match("^dry%-run: (.*)$")
-      if c then cmds[#cmds + 1] = c end
-    end
-    if dry or #cmds > 0 then
-      noctalia.notify("ROG helper dry run", #cmds > 0 and table.concat(cmds, "\n") or "Nothing to do")
-    end
+    Common.notifyDryRun(res.stderr, dry)
     if res.timedOut then
       setNote(section, "Timed out", "error", 6)
     elseif res.exitCode == 3 then
@@ -595,7 +582,7 @@ end
 -- up here, once subHeader and toggleRow exist.
 Awake.setup({
   choices = choices, iconRow = iconRow, label = label, section = section, toggleRow = toggleRow,
-  subHeader = subHeader, caption = caption, noteRow = noteRow, packed = packed, parse = parse,
+  subHeader = subHeader, caption = caption, noteRow = noteRow, packed = packed,
   picked = picked, bin = AWAKECTL,
   render = function() if isOpen then render() end end,
   act = actAwake,
@@ -1021,29 +1008,12 @@ render = function()
   panel.render(ui.column({ flexGrow = 1, gap = 14 }, { ui.column({ key = "view:" .. view, flexGrow = 1, gap = 14 }, kids) }))
 end
 
--- The plugin's dry_run setting has to reach the systemd units too, and they
--- only see ~/.config/rog-helper/dry-run (the bar widget does the same). The
--- flag is written with a marker, so turning the setting off never removes a
--- flag the user touched by hand.
-local FLAG_MARK = "set by the ROG helper plugin's dry_run setting\n"
-local function syncDryRunFlag()
-  local conf = noctalia.getenv("XDG_CONFIG_HOME") or ""
-  if conf == "" then conf = noctalia.expandPath("~/.config") end
-  local flag = conf .. "/rog-helper/dry-run"
-  if noctalia.getConfig("dry_run") == true then
-    if not noctalia.fileExists(flag) then
-      noctalia.mkdirAll(conf .. "/rog-helper")
-      noctalia.writeFile(flag, FLAG_MARK)
-    end
-  elseif noctalia.fileExists(flag) and noctalia.readFile(flag) == FLAG_MARK then
-    noctalia.removeFile(flag)
-  end
-end
-
-syncDryRunFlag()
+-- The dry_run setting reaches the systemd units through a flag file (the bar
+-- widget keeps it in sync too).
+Common.syncDryRunFlag()
 
 function onConfigChanged()
-  syncDryRunFlag()
+  Common.syncDryRunFlag()
   if isOpen then render() end
 end
 

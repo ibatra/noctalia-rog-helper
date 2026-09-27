@@ -8,6 +8,7 @@
 -- Kept to the Lua 5.4 subset of Luau so tests/awake_view.lua can run it
 -- headless (`lua rog-helper/tests/awake_view.lua`).
 
+local Common = require("./common.luau")
 local Awake = {}
 
 local B = nil -- building blocks and panel hooks, from setup()
@@ -16,7 +17,7 @@ local loading, again = false, false
 local batteryDraft = nil -- Battery below, while the slider is dragged
 
 -- B: choices, iconRow, label, section, toggleRow, subHeader, caption, noteRow,
--- packed, parse, picked (the panel's table), bin (awakectl path),
+-- packed, picked (the panel's table), bin (awakectl path),
 -- render(), act(section, id, args), hover()
 function Awake.setup(blocks)
   B = blocks
@@ -38,7 +39,7 @@ function Awake.refresh()
   noctalia.runAsync({ B.bin, "status" }, function(res)
     loading = false
     if res.exitCode == 0 then
-      snap = B.parse(res.stdout)
+      snap = Common.parse(res.stdout)
       noctalia.state.set("rog.awake", snap)
     end
     if again then
@@ -51,12 +52,7 @@ end
 
 -- ── derived text ──────────────────────────────────────────────────────────────
 
--- "1:42", or "42 min" under an hour; rounded up so the last minute never reads 0.
-local function duration(secs)
-  local m = math.ceil(secs / 60)
-  if m < 60 then return m .. " min" end
-  return string.format("%d:%02d", math.floor(m / 60), m % 60)
-end
+local duration = Common.duration
 
 local function timeLeft(s)
   if s.left == "inf" then return "∞" end

@@ -45,7 +45,15 @@ local function newNoctalia()
   return nc
 end
 
+-- Noctalia's require("./x.luau") loads a file next to the requiring one,
+-- sharing the requiring script's globals (noctalia, ui).
 local function loadScript(path, env)
+  local modules = {}
+  env.require = function(name)
+    local file = assert(name:match("^%./(.+%.luau)$"), "unexpected require " .. name)
+    if modules[file] == nil then modules[file] = assert(loadfile(RH .. "/" .. file, "t", env))() end
+    return modules[file]
+  end
   local chunk = assert(loadfile(path, "t", env))
   local ok, err = pcall(chunk)
   if not ok then error(path .. ": " .. tostring(err)) end

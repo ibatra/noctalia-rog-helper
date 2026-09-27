@@ -64,6 +64,14 @@ local B = {
   hover = function() return "" end,
 }
 
+-- Noctalia's require("./x.luau") loads a file next to the requiring one
+local modules = {}
+function require(name)
+  local file = assert(name:match("^%./(.+%.luau)$"), "unexpected require " .. name)
+  if modules[file] == nil then modules[file] = assert(loadfile(HERE .. "/../" .. file))() end
+  return modules[file]
+end
+
 local Awake = assert(loadfile(HERE .. "/../awake_view.luau"))()
 Awake.setup(B)
 
