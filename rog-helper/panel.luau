@@ -226,6 +226,10 @@ local R_TILE = 16
 local FILL_IDLE = "surface_variant" -- inactive tiles, tracks, chips, cards
 local FILL_HOVER = "hover"
 local FILL_ON = "primary"
+-- Bare items (track options, nav buttons) still need an explicit fill: a nil
+-- fill leaves a retained node's previous fill in place, so a hover highlight
+-- would never clear.
+local FILL_NONE = "surface_variant/0.01"
 
 -- Content colour on a fill: on_primary on an active choice, on_hover on a
 -- hovered one, otherwise `idle`.
@@ -235,9 +239,37 @@ local function ink(active, hovered, idle)
   return idle
 end
 
-local function hoverHandler(state, key)
-  if state == "true" then hover = key elseif hover == key then hover = "" end
-  render()
+-- A render() made inside a pointer callback is not always applied (seen with
+-- a burst of enter/leave events: the panel showed the state one step behind),
+-- which left hover highlights stuck and piling up. So hover changes also queue
+-- one more render for after the callback returns; runAsync's completion is the
+-- only deferred hook the plugin API has. Bursts share the one queued render.
+local renderQueued = false
+local function renderSoon()
+  if renderQueued then return end
+  renderQueued = true
+  noctalia.runAsync({ "true" }, function()
+    renderQueued = false
+    if isOpen then render() end
+  end, 2000)
+end
+
+-- One onHover closure per item, bound to that item's key, so the key never
+-- depends on which sibling registered a shared handler last.
+-- While the panel opens and lays out, Noctalia sends stray enter events for
+-- whatever lands under a stale pointer position (the pointer is still on the
+-- bar), which lit an item nobody pointed at. Enters in that window are dropped.
+local HOVER_SETTLE_MS = 400
+local openedAt = 0
+
+local function hoverHandler(key)
+  return function(state)
+    local entering = state == "true" or state == true
+    if entering and noctalia.nowMs() - openedAt < HOVER_SETTLE_MS then return end
+    if entering then hover = key elseif hover == key then hover = "" end
+    render()
+    renderSoon()
+  end
 end
 
 local function caption(text, color)
@@ -266,7 +298,7 @@ local function tile(section, opt, selected)
     key = key, flexGrow = 1, gap = 3, paddingV = 9, radius = R_TILE, fill = fill, align = "center",
     opacity = (opt.enabled == false) and 0.35 or 1,
     onClick = enabled and not active and opt.onClick or nil,
-    onHover = hoverHandler,
+    onHover = hoverHandler(key),
   }, {
     ui.glyph({ name = opt.glyph, size = 19, color = color }),
     ui.label({ text = opt.label, fontSize = 12, color = color }),
@@ -278,12 +310,12 @@ local function segment(section, opt, selected)
   local active = opt.id == selected
   local enabled = opt.enabled ~= false and not busy[section]
   local hovered = not active and enabled and hover == key
-  local fill = active and FILL_ON or (hovered and FILL_HOVER or nil)
+  local fill = active and FILL_ON or (hovered and FILL_HOVER or FILL_NONE)
   return ui.row({
     key = key, flexGrow = 1, paddingV = 6, radius = 99, fill = fill, justify = "center", align = "center",
     opacity = (opt.enabled == false) and 0.35 or 1,
     onClick = enabled and not active and opt.onClick or nil,
-    onHover = hoverHandler,
+    onHover = hoverHandler(key),
   }, {
     ui.label({ text = opt.label, fontSize = 12, color = ink(active, hovered, "on_surface_variant") }),
   })
@@ -316,7 +348,7 @@ local function chip(key, text, on, onClick)
   local kids = {}
   if on then kids[#kids + 1] = ui.glyph({ name = "check", size = 13, color = color }) end
   kids[#kids + 1] = ui.label({ text = text, fontSize = 12, color = color })
-  return ui.row({ key = key, gap = 4, paddingH = 9, paddingV = 6, radius = 99, fill = fill, align = "center", onClick = onClick, onHover = hoverHandler }, kids)
+  return ui.row({ key = key, gap = 4, paddingH = 9, paddingV = 6, radius = 99, fill = fill, align = "center", onClick = onClick, onHover = hoverHandler(key) }, kids)
 end
 
 local function noteRow(section, extra)
@@ -510,14 +542,14 @@ local function navButton(id, glyph, text)
   local color = ink(false, hover == key, "on_surface_variant")
   return ui.row({
     key = key, flexGrow = 1, gap = 6, paddingV = 7, radius = 99,
-    fill = hover == key and FILL_HOVER or nil, justify = "center", align = "center",
+    fill = hover == key and FILL_HOVER or FILL_NONE, justify = "center", align = "center",
     onClick = function()
       view = id
       hover = ""
       if id == "sleep" then Awake.refresh() else refreshExtra() end
       render()
     end,
-    onHover = hoverHandler,
+    onHover = hoverHandler(key),
   }, {
     ui.glyph({ name = glyph, size = 15, color = color }),
     ui.label({ text = text, fontSize = 12, color = color }),
@@ -643,6 +675,8 @@ end)
 
 function onOpen(context)
   isOpen = true
+  openedAt = noctalia.nowMs()
+  hover = ""
   ticks = 0
   Lighting.readTheme()
   st = noctalia.state.get("rog.status") or st

@@ -53,7 +53,7 @@ local function swatch(key, hex, selected, onClick, glyph)
     local dark = hex and (tonumber(hex:sub(1, 2), 16) * 0.3 + tonumber(hex:sub(3, 4), 16) * 0.59 + tonumber(hex:sub(5, 6), 16) * 0.11) > 140
     kids[1] = ui.glyph({ name = glyph or "check", size = 14, color = hex and (dark and "#000000" or "#ffffff") or "on_surface_variant" })
   end
-  return ui.column({ key = key, width = 24, height = 24, radius = 99, fill = fill, align = "center", justify = "center", onClick = onClick, onHover = hoverHandler }, kids)
+  return ui.column({ key = key, width = 24, height = 24, radius = 99, fill = fill, align = "center", justify = "center", onClick = onClick, onHover = hoverHandler(key) }, kids)
 end
 
 local function colourRow(which, current, apply)
