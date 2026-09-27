@@ -226,8 +226,9 @@ function Awake.view()
     }),
     footer(s)
   )
-  -- taller than the panel: the header stays, the rest scrolls
-  return { B.subHeader("Sleep & lid", headline(s)), ui.scroll({ flexGrow = 1, gap = 14 }, body) }
+  -- the panel keeps the header in place and scrolls the rest
+  table.insert(body, 1, B.subHeader("Sleep & lid", headline(s)))
+  return body
 end
 
 return Awake

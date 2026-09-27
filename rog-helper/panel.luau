@@ -981,6 +981,10 @@ end
 
 -- ── render / lifecycle ────────────────────────────────────────────────────────
 
+-- The panel has a fixed height (plugin.toml) and clips whatever doesn't fit,
+-- and rows come and go (notes, Restart, the Awake row, With monitor). So every
+-- view keeps its header, and the main view its Power/Fans/Lighting/Sleep row,
+-- in place and scrolls the rest when it runs taller than the panel.
 render = function()
   local body
   if view == "power" then body = powerView()
@@ -988,13 +992,14 @@ render = function()
   elseif view == "lighting" then body = lightingView()
   elseif view == "sleep" then body = Awake.view()
   else body = mainView() end
-  if noctalia.getConfig("dry_run") == true then
-    table.insert(body, 1, caption("Dry run: buttons only show their commands", "tertiary"))
-  end
-  local kids = {}
+  local items = {}
   for i = 1, 24 do
-    if body[i] then kids[#kids + 1] = body[i] end
+    if body[i] then items[#items + 1] = body[i] end
   end
+  local head = table.remove(items, 1)
+  local foot = view == "main" and table.remove(items) or nil
+  local dry = noctalia.getConfig("dry_run") == true and caption("Dry run: buttons only show their commands", "tertiary") or nil
+  local kids = packed(dry, head, #items > 0 and ui.scroll({ flexGrow = 1, gap = 14 }, items) or nil, foot)
   -- keyed by view so retained nodes never carry props across views
   panel.render(ui.column({ flexGrow = 1, gap = 14 }, { ui.column({ key = "view:" .. view, flexGrow = 1, gap = 14 }, kids) }))
 end
