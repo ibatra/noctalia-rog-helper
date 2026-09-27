@@ -147,7 +147,7 @@ kill -HUP "$W"
 wait_for 1500 status_is held=sleep,lid; eq "loop: SIGHUP wakes it before the 2 s poll" 0 $?
 kill -0 "$W" 2>/dev/null; eq "loop: SIGHUP is not fatal" 0 $?
 up=$(cat "$T/udev.pid")
-kill -TERM "$W"; wait "$W"; eq "loop: SIGTERM exits 143" 143 $?
+kill -TERM "$W"; wait "$W"; eq "loop: SIGTERM is a clean stop (exit 0)" 0 $?
 eq "loop: exit dropped the locks" "held=" "$(grep '^held=' "$T/conf/awake.status")"
 has "loop: exit logged the drops" "dry-run: inhibit lid off" "$(cat "$T/loop.out")"
 gone "$up"; eq "loop: udevadm reaped" 0 $?

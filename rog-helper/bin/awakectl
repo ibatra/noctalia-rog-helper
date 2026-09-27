@@ -338,6 +338,9 @@ PartOf=graphical-session.target
 ExecStart=$SELF watch
 Restart=on-failure
 RestartSec=5
+# A SIGTERM stop exits 0; 143 is also a clean stop for a watcher still running
+# an older copy of this script, which exited 143 on SIGTERM.
+SuccessExitStatus=143
 
 [Install]
 WantedBy=graphical-session.target
@@ -650,7 +653,9 @@ cmd_watch() {
   [ -f "$STATUS" ] && ENDED=$(sed -n 's/^ended=//p' "$STATUS" | tail -n1)
   trap cleanup EXIT
   trap 'exit 130' INT
-  trap 'exit 143' TERM
+  # systemd stops the unit with SIGTERM (logout, disable --now): that is a
+  # clean stop, not a failure, so exit 0 once cleanup has dropped the locks
+  trap 'exit 0' TERM
   trap : HUP   # not fatal before the loop is up
   boot_check
   if [ "$once" = 1 ]; then watch_pass; exit 0; fi

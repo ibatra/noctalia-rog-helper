@@ -25,6 +25,7 @@ PATH=$P ctl start screen 90
 eq "start sets session" "session=screen" "$(grep '^session=' "$T/conf/awake")"
 eq "start sets deadline" "until=6400" "$(grep '^until=' "$T/conf/awake")"
 has "start writes unit" "ExecStart=" "$(cat "$T/systemd/user/rog-helper-awake.service")"
+has "unit: a SIGTERM stop is not a failure" "SuccessExitStatus=143" "$(cat "$T/systemd/user/rog-helper-awake.service")"
 has "start enables unit" "systemctl --user enable -q rog-helper-awake.service" "$(cat "$T/sysctl.log")"
 PATH=$P ctl stop
 eq "stop clears session" "session=none" "$(grep '^session=' "$T/conf/awake")"
