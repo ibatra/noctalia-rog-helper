@@ -15,6 +15,9 @@ local ROGCTL = PLUGIN_DIR .. "/bin/rogctl"
 local AWAKECTL = PLUGIN_DIR .. "/bin/awakectl"
 local Common = require("./common.luau")
 local Awake = require("./awake_view.luau")
+local Power = require("./power_view.luau")
+local Fans = require("./fans_view.luau")
+local Lighting = require("./lighting_view.luau")
 local REFRESH_EVERY = 5 -- seconds
 local REFRESH_EXTRA_EVERY = 15 -- seconds, sub-views only (several asusctl calls)
 
@@ -30,11 +33,6 @@ local loading, loadingExtra = false, false
 local reloadAgain, reloadExtraAgain = false, false -- asked for while one was in flight
 
 local view = "main" -- main | power | fans | lighting | sleep
-local powerMode = nil -- which mode's CPU limits are being edited
-local drafts = {} -- mode -> { pl1, pl2 } while editing
-local fanProfile = nil -- balanced | performance
-local lightTab = "keyboard" -- keyboard | slash
-local themeHex = nil
 
 -- ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -56,17 +54,6 @@ end
 
 local function notifyAction(body)
   noctalia.runAsync({ "noctalia", "msg", "notification-show", "ROG helper", body })
-end
-
--- Theme primary as RRGGBB, from the palette Noctalia writes for Hyprland.
-local function readThemeHex()
-  local s = noctalia.readFile("~/.config/hypr/noctalia.lua") or ""
-  local hex = s:match('local primary = "rgb%((%x%x%x%x%x%x)%)"')
-  if not hex then
-    local css = noctalia.readFile("~/.config/gtk-4.0/noctalia.css") or ""
-    hex = css:match("@define%-color accent_color #(%x%x%x%x%x%x)") or css:match("primary[^#]*#(%x%x%x%x%x%x)")
-  end
-  return hex and hex:lower() or nil
 end
 
 local render
@@ -503,14 +490,19 @@ local function batterySection()
   })
 end
 
-local function keyboardSection()
-  if not has(st, "kbd") then return nil end
+-- Keyboard backlight levels, on the main view and in the Lighting view.
+local function kbdOptions()
   local opts = {}
   for i, n in ipairs({ "Off", "Low", "Medium", "High" }) do
     local id = tostring(i - 1)
     opts[#opts + 1] = { id = id, label = n, onClick = function() act("kbd", id, { "kbd", id }) end }
   end
-  return section({ iconRow("keyboard", choices("segment", "kbd", opts, picked.kbd or st.kbd)), noteRow("kbd") })
+  return opts
+end
+
+local function keyboardSection()
+  if not has(st, "kbd") then return nil end
+  return section({ iconRow("keyboard", choices("segment", "kbd", kbdOptions(), picked.kbd or st.kbd)), noteRow("kbd") })
 end
 
 local function navButton(id, glyph, text)
@@ -593,395 +585,23 @@ local function loadingView(title)
   return { subHeader(title), caption("Reading…") }
 end
 
--- ── power view ────────────────────────────────────────────────────────────────
-
-local function draftFor(mode)
-  if drafts[mode] then return drafts[mode] end
-  local d1, d2 = num(ex.pl1_default) or 0, num(ex.pl2_default) or 0
-  local c = ex["pl_" .. mode] or ""
-  local a, b = c:match("^(%d+),(%d+)$")
-  drafts[mode] = { pl1 = num(a) or d1, pl2 = num(b) or d2 }
-  return drafts[mode]
-end
-
-local function powerView()
-  if not ex.pl1_default then return loadingView("Power") end
-  local mode = powerMode or (PERF_LABEL[st.perf] and st.perf) or "balanced"
-  powerMode = mode
-  local d = draftFor(mode)
-  local max1, max2 = num(ex.pl1_default) or 110, num(ex.pl2_default) or 110
-  local custom = (ex["pl_" .. mode] or "") ~= ""
-  local changed = d.pl1 ~= (custom and num((ex["pl_" .. mode]):match("^(%d+)")) or max1)
-    or d.pl2 ~= (custom and num((ex["pl_" .. mode]):match(",(%d+)$")) or max2)
-
-  local acSel = picked.auto_ac
-  if not acSel then
-    local p = ex.auto_pending_ac
-    acSel = p == "Performance" and "turbo" or p == "Balanced" and "balanced" or ex.auto_ac
-  end
-  local batSel = picked.auto_battery
-  if not batSel then
-    local p = ex.auto_pending_battery
-    batSel = (ex.bat_silent == "1" or p == "Quiet" or p == "LowPower") and "silent"
-      or p == "Performance" and "turbo" or p == "Balanced" and "balanced" or ex.auto_battery
-  end
-  local function auto(src, id) return function() act("auto_" .. src, id, { "auto", src, id }, "extra") end end
-
-  local modeTabs = {}
-  for _, m in ipairs({ "silent", "balanced", "turbo" }) do
-    modeTabs[#modeTabs + 1] = { id = m, label = PERF_LABEL[m], onClick = function()
-      powerMode = m
-      render()
-    end }
-  end
-
-  -- Without asusd's Quiet, Silent is a pkexec write, so the automatic switch
-  -- after each unplug asks for the password.
-  local batNote = noteRow("auto_battery")
-  if not batNote and batSel == "silent" and ex.silent_needs_root ~= "0" then
-    batNote = caption("Switching to Silent after unplugging asks for your password")
-  end
-
-  local limits = nil
-  if has(ex, "rapl") then
-    limits = section({
-      label("CPU power limits", custom and "Custom" or "Firmware"),
-      choices("segment", "plmode", modeTabs, mode),
-      ui.row({ align = "center", gap = 8 }, {
-        ui.label({ text = "Sustained", fontSize = 12, color = "on_surface", width = 76 }),
-        ui.slider({ key = "pl1:" .. mode, min = 5, max = max1, step = 1, value = d.pl1, flexGrow = 1, controlSize = "sm",
-          onChange = function(v)
-            d.pl1 = math.floor(tonumber(v) or d.pl1)
-            if d.pl2 < d.pl1 then d.pl2 = d.pl1 end
-            render()
-          end }),
-        ui.label({ text = `{d.pl1} W`, fontSize = 12, color = "on_surface_variant", width = 44, textAlign = "end" }),
-      }),
-      ui.row({ align = "center", gap = 8 }, {
-        ui.label({ text = "Boost", fontSize = 12, color = "on_surface", width = 76 }),
-        ui.slider({ key = "pl2:" .. mode, min = 5, max = max2, step = 1, value = d.pl2, flexGrow = 1, controlSize = "sm",
-          onChange = function(v)
-            d.pl2 = math.floor(tonumber(v) or d.pl2)
-            if d.pl1 > d.pl2 then d.pl1 = d.pl2 end
-            render()
-          end }),
-        ui.label({ text = `{d.pl2} W`, fontSize = 12, color = "on_surface_variant", width = 44, textAlign = "end" }),
-      }),
-      ui.row({ gap = 6, justify = "end" }, {
-        ui.button({ text = "Reset", controlSize = "sm", variant = "ghost", enabled = custom or changed, onClick = function()
-          drafts[mode] = nil
-          act("rapl", "reset", { "rapl", "reset", mode }, "extra")
-        end }),
-        ui.button({ text = "Apply", controlSize = "sm", variant = "secondary", enabled = changed and not busy.rapl, onClick = function()
-          act("rapl", "set", { "rapl", "set", mode, tostring(d.pl1), tostring(d.pl2) }, "extra")
-          drafts[mode] = nil
-        end }),
-      }),
-      noteRow("rapl") or caption("Caps only. Applying asks for your password"),
-    })
-  end
-  local boost = has(ex, "boost") and toggleRow("CPU boost", (picked.boost or ex.boost) == "1", function(v)
-    act("boost", v == "true" and "1" or "0", { "boost", v == "true" and "on" or "off" }, "extra")
-  end) or nil
-
-  return packed(
-    subHeader("Power", `CPU base {ex.cpu_base_power or "?"} W, dGPU {ex.gpu_base_tgp or "?"} W`),
-    section({
-      label("When plugged in"),
-      choices("segment", "auto_ac", {
-        { id = "balanced", label = "Balanced", onClick = auto("ac", "balanced") },
-        { id = "turbo", label = "Turbo", onClick = auto("ac", "turbo") },
-      }, acSel),
-      label("On battery"),
-      choices("segment", "auto_battery", {
-        { id = "silent", label = "Silent", onClick = auto("battery", "silent") },
-        { id = "balanced", label = "Balanced", onClick = auto("battery", "balanced") },
-        { id = "turbo", label = "Turbo", onClick = auto("battery", "turbo") },
-      }, batSel),
-      noteRow("auto_ac"),
-      batNote,
-    }),
-    limits,
-    boost,
-    boost and noteRow("boost")
-  )
-end
-
--- ── fans view ─────────────────────────────────────────────────────────────────
-
--- Resample an 8-point curve onto an even temperature axis for the graph.
-local function curveSamples(spec, t0, t1, n)
-  if not spec then return {} end
-  local ts, ps = spec:match("^([^;]*);([^;]*)")
-  if not ts then return {} end
-  local T, P = {}, {}
-  for v in ts:gmatch("%d+") do T[#T + 1] = tonumber(v) end
-  for v in ps:gmatch("%d+") do P[#P + 1] = tonumber(v) end
-  local out = {}
-  for i = 0, n - 1 do
-    local t = t0 + (t1 - t0) * i / (n - 1)
-    local p = P[#P] or 0
-    if t <= (T[1] or 0) then
-      p = P[1] or 0
-    else
-      for j = 2, #T do
-        if t <= T[j] then
-          local f = (t - T[j - 1]) / math.max(1, T[j] - T[j - 1])
-          p = P[j - 1] + (P[j] - P[j - 1]) * f
-          break
-        end
-      end
-    end
-    out[#out + 1] = p / 255
-  end
-  return out
-end
-
--- Preview curve for a preset without asking rogctl (same maths as fan_preset).
-local function presetSpec(spec, preset)
-  if not spec or spec == "" or preset == "default" then return spec end
-  local ts, ps = spec:match("^([^;]*);([^;]*)")
-  if not ts then return spec end
-  local T, out, prev = {}, {}, 0
-  for v in ts:gmatch("%d+") do T[#T + 1] = tonumber(v) end
-  local i = 0
-  for v in ps:gmatch("%d+") do
-    i += 1
-    local p, t = tonumber(v), T[i]
-    if preset == "quiet" then
-      if t < 60 then p = p * 0.7 elseif t < 70 then p = p * 0.85 end
-    elseif preset == "cool" then
-      p = p * 1.25 + 8
-    end
-    p = math.min(255, math.floor(p + 0.5))
-    if p < prev then p = prev end
-    prev = p
-    out[#out + 1] = tostring(p)
-  end
-  return ts .. ";" .. table.concat(out, ",")
-end
-
-local function fansView()
-  if not ex.stock_balanced_cpu then return loadingView("Fans") end
-  if not has(ex, "fan_curves") then
-    return { subHeader("Fans"), caption("This model doesn't expose fan curves") }
-  end
-  local prof = fanProfile or (st.perf == "turbo" and "performance" or "balanced")
-  fanProfile = prof
-  local saved = ex["fan_" .. prof] or ""
-  local preset = picked["fan_" .. prof] or (saved ~= "" and saved) or "default"
-  -- Quiet and Cool are built from the stock curve, seen only while custom
-  -- curves are off
-  local stockKnown = (ex["stock_" .. prof .. "_cpu"] or "") ~= "" and (ex["stock_" .. prof .. "_gpu"] or "") ~= ""
-  local showCpu = presetSpec(ex["stock_" .. prof .. "_cpu"], preset)
-  local showGpu = presetSpec(ex["stock_" .. prof .. "_gpu"], preset)
-
-  local function pick(id) return function() act("fan_" .. prof, id, { "fan", prof, id }, "extra") end end
-  local rpm = ""
-  if st.fan_cpu then rpm = `CPU {st.fan_cpu} rpm, GPU {st.fan_gpu or "0"} rpm` end
-
-  return {
-    subHeader("Fans", rpm),
-    section({
-      label("Curve for"),
-      choices("segment", "fanprof", {
-        { id = "balanced", label = "Balanced", onClick = function() fanProfile = "balanced"; render() end },
-        { id = "performance", label = "Turbo", onClick = function() fanProfile = "performance"; render() end },
-      }, prof),
-    }),
-    ui.column({ gap = 4, padding = 10, radius = R_TILE, fill = FILL_IDLE }, {
-      ui.graph({ height = 96, values = curveSamples(showCpu, 30, 90, 31), values2 = curveSamples(showGpu, 30, 90, 31),
-        color = "primary", color2 = "tertiary", lineWidth = 2, fillOpacity = 0.12 }),
-      ui.row({ align = "center", gap = 10 }, {
-        caption("30°"),
-        ui.spacer({ flexGrow = 1 }),
-        stat("point-filled", "CPU", "primary"),
-        stat("point-filled", "GPU", "tertiary"),
-        ui.spacer({ flexGrow = 1 }),
-        caption("90°"),
-      }),
-    }),
-    section({
-      label("Preset"),
-      choices("segment", "fan_" .. prof, {
-        { id = "default", label = "Stock", onClick = pick("default") },
-        { id = "quiet", label = "Quiet", enabled = stockKnown, onClick = pick("quiet") },
-        { id = "cool", label = "Cool", enabled = stockKnown, onClick = pick("cool") },
-      }, preset),
-      noteRow("fan_" .. prof),
-      caption(not stockKnown and "Stock curve unknown: pick Stock (or reset curves in asusctl) first"
-        or st.perf == "silent" and "Silent always uses the firmware curve" or "Never quieter than stock above 70°"),
-    }),
-  }
-end
-
--- ── lighting view ─────────────────────────────────────────────────────────────
-
-local SWATCHES = { "ffffff", "ff2a2a", "ff7a00", "28e070", "00d0ff", "3060ff", "a040ff" }
-
-local function swatch(key, hex, selected, onClick, glyph)
-  if hex == "000000" then -- "off" for the second colour; black vanishes on OLED
-    hex = nil
-    glyph = selected and "check" or "x"
-  end
-  local fill = hex and ("#" .. hex) or FILL_IDLE
-  local kids = {}
-  if selected or glyph then
-    local dark = hex and (tonumber(hex:sub(1, 2), 16) * 0.3 + tonumber(hex:sub(3, 4), 16) * 0.59 + tonumber(hex:sub(5, 6), 16) * 0.11) > 140
-    kids[1] = ui.glyph({ name = glyph or "check", size = 14, color = hex and (dark and "#000000" or "#ffffff") or "on_surface_variant" })
-  end
-  return ui.column({ key = key, width = 24, height = 24, radius = 99, fill = fill, align = "center", justify = "center", onClick = onClick, onHover = hoverHandler }, kids)
-end
-
-local function colourRow(which, current, apply)
-  local kids = {}
-  local seen = false
-  local list = {}
-  if themeHex then list[#list + 1] = themeHex end
-  for _, h in ipairs(SWATCHES) do list[#list + 1] = h end
-  if which == 2 then table.insert(list, 1, "000000") end
-  for i, h in ipairs(list) do
-    local sel = current == h
-    if sel then seen = true end
-    kids[#kids + 1] = swatch(`sw{which}:{i}`, h, sel, function() apply(h) end)
-  end
-  -- current colour when it is none of the presets, then the picker
-  if current and current ~= "" and not seen then
-    kids[#kids + 1] = swatch(`sw{which}:cur`, current, true, nil)
-  end
-  kids[#kids + 1] = swatch(`sw{which}:pick`, nil, false, function()
-    noctalia.openColorPicker("#" .. (current ~= "" and current or "ffffff"), function(color)
-      if color then apply(color:gsub("#", ""):sub(1, 6):lower()) end
-    end)
-  end, "color-picker")
-  return ui.row({ gap = 6, align = "center" }, kids)
-end
-
-local EFFECTS = {
-  { id = "static", ron = "Static", label = "Static" },
-  { id = "breathe", ron = "Breathe", label = "Breathe" },
-  { id = "pulse", ron = "Pulse", label = "Pulse" },
-  { id = "cycle", ron = "RainbowCycle", label = "Cycle" },
-  { id = "wave", ron = "RainbowWave", label = "Wave" },
+-- The Power, Fans and Lighting views (power_view.luau, fans_view.luau,
+-- lighting_view.luau) are drawn from these blocks, act through rogctl, and
+-- read the snapshots at render time.
+local blocks = {
+  caption = caption, label = label, section = section, choices = choices, iconRow = iconRow,
+  chip = chip, noteRow = noteRow, stat = stat, packed = packed, subHeader = subHeader,
+  toggleRow = toggleRow, loadingView = loadingView, hoverHandler = hoverHandler, kbdOptions = kbdOptions,
+  R_TILE = R_TILE, FILL_IDLE = FILL_IDLE, PERF_LABEL = PERF_LABEL,
+  num = num, has = has, picked = picked, busy = busy,
+  st = function() return st end,
+  ex = function() return ex end,
+  act = act,
+  render = function() render() end,
 }
-
-local function lightingKeyboard()
-  local cur = "static"
-  for _, e in ipairs(EFFECTS) do if e.ron == ex.aura_mode then cur = e.id end end
-  cur = picked.aura or cur
-  local c1, c2, sp = ex.aura_colour or "ffffff", ex.aura_colour2 or "000000", ex.aura_speed or "med"
-  local function apply(mode, a, b, s) act("aura", mode, { "aura", mode, a or c1, b or c2, s or sp }, "extra") end
-
-  local effectOpts = {}
-  for _, e in ipairs(EFFECTS) do
-    effectOpts[#effectOpts + 1] = { id = e.id, label = e.label, onClick = function() apply(e.id) end }
-  end
-  local kbdOpts = {}
-  for i, n in ipairs({ "Off", "Low", "Medium", "High" }) do
-    local id = tostring(i - 1)
-    kbdOpts[#kbdOpts + 1] = { id = id, label = n, onClick = function() act("kbd", id, { "kbd", id }) end }
-  end
-
-  local parts = {}
-  if has(st, "kbd") then parts[#parts + 1] = iconRow("sun", choices("segment", "kbd", kbdOpts, picked.kbd or st.kbd)) end
-  if not has(ex, "aura") then
-    if #parts == 0 then parts[1] = caption("No keyboard lighting controls on this model") end
-    return parts
-  end
-  parts[#parts + 1] = section({ iconRow("sparkles", choices("segment", "aura", effectOpts, cur)), noteRow("aura") })
-  if cur == "static" or cur == "breathe" or cur == "pulse" then
-    parts[#parts + 1] = section({ label("Colour"), colourRow(1, c1, function(h) apply(cur, h) end) })
-  end
-  if cur == "breathe" then
-    parts[#parts + 1] = section({ label("Second colour"), colourRow(2, c2, function(h) apply(cur, nil, h) end) })
-  end
-  if cur == "breathe" or cur == "cycle" or cur == "wave" then
-    parts[#parts + 1] = iconRow("gauge", choices("segment", "aura_speed", {
-      { id = "low", label = "Slow", onClick = function() apply(cur, nil, nil, "low") end },
-      { id = "med", label = "Medium", onClick = function() apply(cur, nil, nil, "med") end },
-      { id = "high", label = "Fast", onClick = function() apply(cur, nil, nil, "high") end },
-    }, sp))
-  end
-  return parts
-end
-
-local function lightingSlash()
-  local on = (picked.slash or ex.slash) == "1"
-  local modes = {}
-  local modeIdx = 0
-  for m in (ex.slash_modes or ""):gmatch("[^,]+") do
-    modes[#modes + 1] = m
-    if m == ex.slash_mode then modeIdx = #modes - 1 end
-  end
-  local ap = {}
-  for v in (ex.aura_power or "1,1,1,1"):gmatch("%d") do ap[#ap + 1] = v == "1" end
-  local function powerChip(i, text)
-    return chip("ap:" .. i, text, ap[i], function()
-      local a = {}
-      for j = 1, 4 do a[j] = ((j == i) ~= ap[j]) and "1" or "0" end
-      act("aura_power", tostring(i), { "aura-power", a[1], a[2], a[3], a[4] }, "extra")
-    end)
-  end
-  local bright = num(ex.slash_brightness) or 255
-
-  local parts = {}
-  if has(ex, "slash") then
-    parts[1] = toggleRow("Slash lighting", on, function(v) act("slash", v == "true" and "1" or "0", { "slash", v == "true" and "on" or "off" }, "extra") end)
-  end
-  if on and has(ex, "slash") then
-    parts[#parts + 1] = ui.row({ gap = 8, align = "center" }, {
-      ui.select({ options = modes, selectedIndex = modeIdx, controlSize = "sm", flexGrow = 1,
-        onChange = function(_i, text) act("slash_mode", text, { "slash", "mode", text }, "extra") end }),
-    })
-    parts[#parts + 1] = ui.row({ align = "center", gap = 8 }, {
-      ui.label({ text = "Brightness", fontSize = 12, color = "on_surface", width = 76 }),
-      ui.slider({ key = "slashb", min = 0, max = 255, step = 5, value = bright, flexGrow = 1, controlSize = "sm",
-        onChange = function(v) ex.slash_brightness = tostring(math.floor(tonumber(v) or bright)) end,
-        onDragEnd = function() act("slash_b", "b", { "slash", "brightness", ex.slash_brightness }, "extra") end }),
-    })
-    parts[#parts + 1] = ui.row({ align = "center", gap = 8 }, {
-      ui.label({ text = "Interval", fontSize = 12, color = "on_surface", width = 76 }),
-      ui.slider({ key = "slashi", min = 0, max = 5, step = 1, value = num(ex.slash_interval) or 0, flexGrow = 1, controlSize = "sm",
-        onChange = function(v) ex.slash_interval = tostring(math.floor(tonumber(v) or 0)) end,
-        onDragEnd = function() act("slash_i", "i", { "slash", "interval", ex.slash_interval }, "extra") end }),
-    })
-    parts[#parts + 1] = ui.row({ gap = 6 }, {
-      chip("sl:bat", "On battery", ex.slash_battery == "1", function()
-        act("slash_bat", "x", { "slash", "battery", ex.slash_battery == "1" and "off" or "on" }, "extra")
-      end),
-      chip("sl:warn", "Low battery warning", ex.slash_warning == "1", function()
-        act("slash_warn", "x", { "slash", "warning", ex.slash_warning == "1" and "off" or "on" }, "extra")
-      end),
-    })
-  end
-  if ex.aura_power then
-    parts[#parts + 1] = section({
-      label("Keyboard lights on"),
-      ui.row({ gap = 5 }, { powerChip(2, "Awake"), powerChip(3, "Sleep"), powerChip(1, "Boot"), powerChip(4, "Shutdown") }),
-      noteRow("aura_power"),
-    })
-  end
-  if has(ex, "boot_sound") then
-    parts[#parts + 1] = toggleRow("Boot sound", (picked.boot_sound or ex.boot_sound) == "1", function(v)
-      act("boot_sound", v == "true" and "1" or "0", { "boot-sound", v == "true" and "on" or "off" }, "extra")
-    end)
-  end
-  if #parts == 0 then parts[1] = caption("Nothing else to set on this model") end
-  return parts
-end
-
-local function lightingView()
-  if not ex.has_aura then return loadingView("Lighting") end
-  local body = {
-    subHeader("Lighting"),
-    choices("segment", "lighttab", {
-      { id = "keyboard", label = "Keyboard", onClick = function() lightTab = "keyboard"; render() end },
-      { id = "slash", label = has(ex, "slash") and "Slash and more" or "More", onClick = function() lightTab = "slash"; render() end },
-    }, lightTab),
-  }
-  for _, p in ipairs(lightTab == "keyboard" and lightingKeyboard() or lightingSlash()) do body[#body + 1] = p end
-  return body
-end
+Power.setup(blocks)
+Fans.setup(blocks)
+Lighting.setup(blocks)
 
 -- ── render / lifecycle ────────────────────────────────────────────────────────
 
@@ -991,9 +611,9 @@ end
 -- in place and scrolls the rest when it runs taller than the panel.
 render = function()
   local body
-  if view == "power" then body = powerView()
-  elseif view == "fans" then body = fansView()
-  elseif view == "lighting" then body = lightingView()
+  if view == "power" then body = Power.view()
+  elseif view == "fans" then body = Fans.view()
+  elseif view == "lighting" then body = Lighting.view()
   elseif view == "sleep" then body = Awake.view()
   else body = mainView() end
   local items = {}
@@ -1024,7 +644,7 @@ end)
 function onOpen(context)
   isOpen = true
   ticks = 0
-  themeHex = readThemeHex()
+  Lighting.readTheme()
   st = noctalia.state.get("rog.status") or st
   if extraView(context) then
     view = context
@@ -1043,7 +663,7 @@ end
 function onClose()
   isOpen = false
   hover = ""
-  drafts = {}
+  Power.reset()
   panel.setWantsSecondTicks(false)
 end
 
@@ -1096,7 +716,7 @@ function onIpc(event, payload)
     if view == "sleep" then Awake.refresh() elseif extraView(view) then refreshExtra() end
     render()
   elseif event == "tab" then
-    lightTab = payload
+    Lighting.setTab(payload)
     render()
   elseif event == "act" then
     local awakeCmd = payload:match("^awake:(.+)$")
