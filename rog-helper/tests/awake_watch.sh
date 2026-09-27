@@ -269,5 +269,48 @@ mk sys/class/power_supply/BAT1/capacity 80
 mk sys/class/power_supply/ACAD/online 1
 mk proc/acpi/button/lid/LID0/state "state:      open"
 
+# the loop polls every 2 s only while polling can see something that matters,
+# and otherwise waits up to 30 s for a udev event or SIGHUP
+fresh; conf "lid_ac=sleep" "lid_bat=sleep"
+step 6000
+eq "wait: nothing to watch, idle wait" 30 "$WAIT"
+conf "lid_ac=awake"
+step 6002
+eq "wait: a lid rule holds the machine, fast" 2 "$WAIT"
+conf "lid_ac=sleep" "session=system" "until=inf"
+step 6004
+eq "wait: a session, fast" 2 "$WAIT"
+conf "lid_ac=sleep"
+mk proc/acpi/button/lid/LID0/state "state:      closed"
+step 6006
+eq "wait: lid closed, fast" 2 "$WAIT"
+mk proc/acpi/button/lid/LID0/state "state:      open"
+mk sys/class/drm/card0-DP-3/status connected
+step 6008
+eq "wait: a monitor connected, fast" 2 "$WAIT"
+mk sys/class/drm/card0-DP-3/status disconnected
+mk sys/class/thermal/thermal_zone0/temp 97000
+step 6010
+eq "wait: heat building up, fast" 2 "$WAIT"
+mk sys/class/thermal/thermal_zone0/temp 50000
+step 6012
+eq "wait: back to idle" 30 "$WAIT"
+# an idle wait is not a resume, a jump beyond it is
+RESUMED_AT=0 WAITED=30
+step 6044
+eq "wait: a 32 s gap after a 30 s wait is no resume" 0 "$RESUMED_AT"
+step 6100
+eq "wait: a 56 s gap after a 30 s wait is a resume" 6100 "$RESUMED_AT"
+WAITED=0
+
+# load_config reads what cfg_get reads: the first line for a key wins,
+# unknown keys and junk lines are skipped, values may contain '='
+printf '%s\n' "lid_ac=sleep" "junk" "nope=1" "=x" "lid_ac=awake" "boot_id=a=b" > "$T/conf/awake"
+load_config
+for kv in $DEFAULTS; do
+  k=${kv%%=*}; v=C_$k
+  eq "load_config matches cfg_get: $k" "$(cfg_get "$k")" "${!v}"
+done
+
 eq "hyprctl never reloaded" "" "$(grep -E 'reload|keyword' "$T/all.log" || true)"
 finish

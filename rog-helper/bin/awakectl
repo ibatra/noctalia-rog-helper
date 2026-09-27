@@ -40,7 +40,12 @@ run() {
   "$@"
 }
 
-rd() { local v; v=$(cat "$1" 2>/dev/null) && printf '%s' "$v" || printf '%s' "${2:-}"; }
+# First line of a (one-line sysfs/proc) file, or $2 when it can't be read.
+# A builtin read, no cat: the watcher reads a dozen of these every pass.
+rd() {
+  local v=
+  if { IFS= read -r v || [ -n "$v" ]; } <"$1" 2>/dev/null; then printf '%s' "$v"; else printf '%s' "${2:-}"; fi
+}
 
 CONF_DIR=${AWAKE_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/rog-helper}
 CONF=$CONF_DIR/awake
@@ -50,7 +55,7 @@ HYPRCTL=${AWAKE_HYPRCTL:-hyprctl}
 UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 UNIT=rog-helper-awake.service
 
-now() { printf '%s' "${AWAKE_NOW:-$(date +%s)}"; }
+now() { printf '%s' "${AWAKE_NOW:-$EPOCHSECONDS}"; }
 
 # ── config ─────────────────────────────────────────────────────────────────────
 
@@ -77,12 +82,20 @@ cfg_set_real() {
   exec {lk}>&-
 }
 
+# Every C_<key>, as cfg_get gives it (the first line for a key wins), read in
+# one pass with no subprocess: the watcher calls this on every pass.
 load_config() {
-  local kv k
-  for kv in $DEFAULTS; do
-    k=${kv%%=*}
-    printf -v "C_${k}" '%s' "$(cfg_get "$k")"
-  done
+  local kv k line
+  local -A seen=()
+  for kv in $DEFAULTS; do printf -v "C_${kv%%=*}" '%s' "${kv#*=}"; done
+  [ -f "$CONF" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *=*) ;; *) continue ;; esac
+    k=${line%%=*}
+    known_key "$k" && [ -z "${seen[$k]:-}" ] || continue
+    seen[$k]=1
+    printf -v "C_${k}" '%s' "${line#*=}"
+  done <"$CONF"
 }
 
 # ── validation ─────────────────────────────────────────────────────────────────
@@ -175,14 +188,16 @@ lid_state() {
   local f
   for f in "$SYS"/proc/acpi/button/lid/*/state; do
     [ -f "$f" ] || continue
-    case "$(cat "$f" 2>/dev/null)" in *closed*) echo closed; return ;; esac
+    case "$(rd "$f")" in *closed*) echo closed; return ;; esac
   done
   echo open
 }
 
 battery_pct() {
-  local b; b=$(ls -d "$SYS"/sys/class/power_supply/BAT* 2>/dev/null | sort | head -n1)
-  [ -n "$b" ] && rd "$b/capacity"
+  local b   # the first BAT*, in sorted (glob) order
+  for b in "$SYS"/sys/class/power_supply/BAT*; do
+    [ -e "$b" ] && rd "$b/capacity"; return
+  done
 }
 
 pkg_temp_c() {
@@ -207,7 +222,7 @@ external_connected() {
     d=${f%/status}; d=${d##*/}   # e.g. card1-eDP-1 or card1-DP-3
     c=${d#card*-}                # strip the "cardN-" prefix -> eDP-1 / DP-3
     case "$c" in eDP*) continue ;; esac
-    [ "$(cat "$f" 2>/dev/null)" = connected ] && { echo 1; return; }
+    [ "$(rd "$f")" = connected ] && { echo 1; return; }
   done
   echo 0
 }
@@ -424,6 +439,7 @@ declare -A PID=()
 SCREEN_DPMS=0 SCREEN_DPMS_EDP= SCREEN_DISABLED=
 EXT_SINCE= HOT_SINCE= SUSPEND_SINCE= RESUMED_AT= LAST_PASS=
 PREV_AC= PREV_LID= ENDED= TEMP= UDEV_PID= CLEANED=0 FIRST_PASS=1
+WAITED=0   # seconds the loop last slept for, so a long idle wait isn't taken for a resume
 
 why_for() {
   case "$1" in
@@ -547,8 +563,8 @@ read_inputs() {
   I_hot=0
   if [ -n "$HOT_SINCE" ] && [ $(( I_now - HOT_SINCE )) -ge 60 ]; then I_hot=1; fi
   if [ "$I_ext" = 1 ]; then EXT_SINCE=${EXT_SINCE:-$I_now}; else EXT_SINCE=; fi
-  # a wall-clock jump between passes is a resume from suspend
-  if [ -n "$LAST_PASS" ] && [ $(( I_now - LAST_PASS )) -gt 20 ]; then RESUMED_AT=$I_now; log "resumed"; fi
+  # a wall-clock jump between passes (beyond the planned wait) is a resume from suspend
+  if [ -n "$LAST_PASS" ] && [ $(( I_now - LAST_PASS - WAITED )) -gt 20 ]; then RESUMED_AT=$I_now; log "resumed"; fi
   LAST_PASS=$I_now
 }
 
@@ -588,6 +604,23 @@ suspend_fallback() {
   fi
 }
 
+# How long the loop may wait for an event before the next pass. Power
+# changes arrive as udev events and config changes as SIGHUP, but the lid,
+# the clock and the CPU temperature can only be polled: poll every 2 s while
+# any of them matters (a session and its timer, a lid rule that holds the
+# machine up, the lid closed, a monitor that the lid-closed screen action
+# would touch, heat building up, a panel we switched off). Otherwise a lid
+# close is logind's to handle, and a slow tick only keeps the status fresh.
+WAIT_FAST=2 WAIT_IDLE=30
+pick_wait() {
+  if [ "$C_session" != none ] || [ "$W_lid" = 1 ] || [ "$I_lid" = closed ] || [ "$I_ext" = 1 ] ||
+     [ -n "$HOT_SINCE" ] || [ -n "$SCREEN_DISABLED" ] || [ "$SCREEN_DPMS" = 1 ]; then
+    WAIT=$WAIT_FAST
+  else
+    WAIT=$WAIT_IDLE
+  fi
+}
+
 write_status() {
   mkdir -p "$CONF_DIR"
   local tmp
@@ -609,6 +642,7 @@ watch_pass() {
   apply_screen
   suspend_fallback
   write_status
+  pick_wait
   PREV_AC=$I_ac PREV_LID=$I_lid
 }
 
@@ -670,7 +704,8 @@ cmd_watch() {
   trap 'echo hup >&3' HUP   # config changed: every pass re-reads it, so just wake up
   while :; do
     watch_pass
-    read -r -t 2 _ <&3
+    read -r -t "$WAIT" _ <&3
+    WAITED=$WAIT
     # drain the burst of events, then act once
     while read -r -t 0.2 _ <&3; do :; done
     kill -0 "$UDEV_PID" 2>/dev/null || { log "udev monitor ended"; exit 1; }
