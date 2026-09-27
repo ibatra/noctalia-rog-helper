@@ -237,18 +237,29 @@ end
 
 -- ── building blocks ───────────────────────────────────────────────────────────
 -- Two control families with a clear job each:
---   tiles  - the big mode switches (Performance, GPU): separate soft slabs,
---            the active one washed in primary with a primary glyph.
---   tracks - every smaller choice: one faint pill track, the active option a
+--   tiles  - the big mode switches (Performance, GPU): separate slabs, styled
+--            like the Control Center's tiles.
+--   tracks - every smaller choice: one pill track, the active option a
 --            primary pill inside it, the rest bare text.
 -- Labels are dropped wherever an icon or the options themselves say enough.
+--
+-- Theme roles only, the ones Noctalia's own panels use, so the panel follows
+-- the palette and sits on the shell's panel background: an active choice is
+-- primary with on_primary content, everything else surface_variant, and a
+-- hovered one hover with on_hover content.
 
 local R_TILE = 16
-local FILL_TILE = "on_surface/0.05"
-local FILL_TRACK = "on_surface/0.05"
-local FILL_HOVER = "on_surface/0.09"
-local FILL_ON = "primary/0.20"
-local FILL_IDLE = FILL_TILE -- chips, swatch backs, cards
+local FILL_IDLE = "surface_variant" -- inactive tiles, tracks, chips, cards
+local FILL_HOVER = "hover"
+local FILL_ON = "primary"
+
+-- Content colour on a fill: on_primary on an active choice, on_hover on a
+-- hovered one, otherwise `idle`.
+local function ink(active, hovered, idle)
+  if active then return "on_primary" end
+  if hovered then return "on_hover" end
+  return idle
+end
 
 local function hoverHandler(state, key)
   if state == "true" then hover = key elseif hover == key then hover = "" end
@@ -274,15 +285,17 @@ local function tile(section, opt, selected)
   local key = section .. ":" .. opt.id
   local active = opt.id == selected
   local enabled = opt.enabled ~= false and not busy[section]
-  local fill = active and FILL_ON or (hover == key and enabled and FILL_HOVER or FILL_TILE)
+  local hovered = not active and enabled and hover == key
+  local fill = active and FILL_ON or (hovered and FILL_HOVER or FILL_IDLE)
+  local color = ink(active, hovered, "on_surface")
   return ui.column({
     key = key, flexGrow = 1, gap = 3, paddingV = 9, radius = R_TILE, fill = fill, align = "center",
     opacity = (opt.enabled == false) and 0.35 or 1,
     onClick = enabled and not active and opt.onClick or nil,
     onHover = hoverHandler,
   }, {
-    ui.glyph({ name = opt.glyph, size = 19, color = active and "primary" or "on_surface_variant" }),
-    ui.label({ text = opt.label, fontSize = 12, fontWeight = active and "semibold" or "normal", color = active and "primary" or "on_surface" }),
+    ui.glyph({ name = opt.glyph, size = 19, color = color }),
+    ui.label({ text = opt.label, fontSize = 12, color = color }),
   })
 end
 
@@ -290,14 +303,15 @@ local function segment(section, opt, selected)
   local key = section .. ":" .. opt.id
   local active = opt.id == selected
   local enabled = opt.enabled ~= false and not busy[section]
-  local fill = active and FILL_ON or (hover == key and enabled and FILL_HOVER or nil)
+  local hovered = not active and enabled and hover == key
+  local fill = active and FILL_ON or (hovered and FILL_HOVER or nil)
   return ui.row({
     key = key, flexGrow = 1, paddingV = 6, radius = 99, fill = fill, justify = "center", align = "center",
     opacity = (opt.enabled == false) and 0.35 or 1,
     onClick = enabled and not active and opt.onClick or nil,
     onHover = hoverHandler,
   }, {
-    ui.label({ text = opt.label, fontSize = 12, fontWeight = active and "semibold" or "normal", color = active and "primary" or "on_surface_variant" }),
+    ui.label({ text = opt.label, fontSize = 12, color = ink(active, hovered, "on_surface_variant") }),
   })
 end
 
@@ -307,7 +321,7 @@ local function choices(kind, section, options, selected)
     children[#children + 1] = (kind == "tile" and tile or segment)(section, o, selected)
   end
   if kind == "tile" then return ui.row({ gap = 6 }, children) end
-  return ui.row({ gap = 2, padding = 3, radius = 99, fill = FILL_TRACK }, children)
+  return ui.row({ gap = 2, padding = 3, radius = 99, fill = FILL_IDLE }, children)
 end
 
 -- A settings row whose leading glyph stands in for its label.
@@ -322,10 +336,12 @@ end
 
 -- Pill that toggles on its own (used for multi-select flags).
 local function chip(key, text, on, onClick)
-  local fill = on and FILL_ON or (hover == key and FILL_HOVER or FILL_IDLE)
+  local hovered = not on and hover == key
+  local fill = on and FILL_ON or (hovered and FILL_HOVER or FILL_IDLE)
+  local color = ink(on, hovered, "on_surface_variant")
   local kids = {}
-  if on then kids[#kids + 1] = ui.glyph({ name = "check", size = 13, color = "primary" }) end
-  kids[#kids + 1] = ui.label({ text = text, fontSize = 12, color = on and "primary" or "on_surface_variant" })
+  if on then kids[#kids + 1] = ui.glyph({ name = "check", size = 13, color = color }) end
+  kids[#kids + 1] = ui.label({ text = text, fontSize = 12, color = color })
   return ui.row({ key = key, gap = 4, paddingH = 9, paddingV = 6, radius = 99, fill = fill, align = "center", onClick = onClick, onHover = hoverHandler }, kids)
 end
 
@@ -512,6 +528,7 @@ end
 
 local function navButton(id, glyph, text)
   local key = "nav:" .. id
+  local color = ink(false, hover == key, "on_surface_variant")
   return ui.row({
     key = key, flexGrow = 1, gap = 6, paddingV = 7, radius = 99,
     fill = hover == key and FILL_HOVER or nil, justify = "center", align = "center",
@@ -523,8 +540,8 @@ local function navButton(id, glyph, text)
     end,
     onHover = hoverHandler,
   }, {
-    ui.glyph({ name = glyph, size = 15, color = "on_surface_variant" }),
-    ui.label({ text = text, fontSize = 12, color = "on_surface_variant" }),
+    ui.glyph({ name = glyph, size = 15, color = color }),
+    ui.label({ text = text, fontSize = 12, color = color }),
   })
 end
 

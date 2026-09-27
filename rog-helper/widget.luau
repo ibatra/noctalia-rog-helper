@@ -105,11 +105,11 @@ local function render()
   local container = barWidget.isVertical() and ui.column or ui.row
   if hasSession then
     barWidget.render(container({ gap = 0, align = "start" }, {
-      ui.glyph({ name = glyphName, color = "secondary" }),
+      ui.glyph({ name = glyphName, color = "on_surface" }),
       ui.box({ width = 5, height = 5, radius = 3, fill = "primary" }),
     }))
   else
-    barWidget.render(container({ align = "start" }, { ui.glyph({ name = glyphName, color = "secondary" }) }))
+    barWidget.render(container({ align = "start" }, { ui.glyph({ name = glyphName, color = "on_surface" }) }))
   end
 
   local rows = {
