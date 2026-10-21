@@ -1,0 +1,37 @@
+# Tailscale - the macOS/Windows menu-bar menu for Tailscale.
+#
+# bar   -> Tailscale's dot grid: dimmed while disconnected, with a small dot
+#          while traffic goes through an exit node. Click drops the menu.
+# panel -> Connect switch, this device (click copies its IP), account
+#          switcher, exit nodes (+ local network access), network devices
+#          (click copies an IP), DNS / subnet / Shields Up, admin console.
+#
+# Changing settings without sudo needs the operator set once:
+#   sudo tailscale set --operator=$USER
+# The menu offers to do it through polkit when a change is refused.
+#
+# Open it with: noctalia msg panel-toggle ishaan/tailscale:panel
+
+id = "ishaan/tailscale"
+name = "Tailscale"
+version = "0.1.0"
+plugin_api = 30
+author = "ishaan"
+license = "MIT"
+dependencies = []
+tags = ["network", "vpn", "tailscale"]
+icon = "grid-dots"
+description = "macOS-style Tailscale menu: connect, switch exit nodes and accounts, copy device IPs."
+
+[[widget]]
+id = "bar"
+entry = "widget.luau"
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+width = 290
+height = 440
+placement = "attached"
+position = "auto"
+open_near_click = true
