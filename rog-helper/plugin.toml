@@ -38,11 +38,11 @@ entry = "widget.luau"
 [[panel]]
 id = "panel"
 entry = "panel.luau"
-width = 316 # Pond panel width, the same as every other bottom-left panel
+width = 316 # Pond panel width, the same as the other panels dropped from the right-hand cards
 height = "content" # the card hugs the main view: no empty strip above the nav row
 max_height = 640 # panel.luau MAX_H must match: room for notes under the main view; sub-views use 592 and scroll
-placement = "floating" # attached panels take the bar's opacity, and the Pond sidebar bar is invisible
-position = "bottom_left" # opened from the sidebar's lower half: pops out bottom-aligned, stacked with the Pond panels
+placement = "floating" # attached panels take the bar's opacity, and the Pond card bar is invisible
+position = "top_right" # opened from the right-hand cards: drops down in the same spot as the Pond panels
 open_near_click = false
 
 [[shortcut]]
