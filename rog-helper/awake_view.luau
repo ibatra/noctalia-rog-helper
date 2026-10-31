@@ -123,7 +123,7 @@ local function batteryRow(s)
           B.render()
         end
       end }),
-    ui.label({ text = value == 0 and "Off" or (value .. "%"), fontSize = 12, color = "on_surface_variant", width = 36, textAlign = "end" }),
+    ui.label({ text = value == 0 and "Off" or (value .. "%"), fontSize = 12, fontFamily = "IBM Plex Mono", color = "on_surface/0.7", width = 36, textAlign = "end" }),
   })
 end
 

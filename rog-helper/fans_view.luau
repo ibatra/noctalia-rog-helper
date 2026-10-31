@@ -24,6 +24,11 @@ function Fans.setup(blocks)
   stat, subHeader, loadingView = B.stat, B.subHeader, B.loadingView
 end
 
+-- Graph axis ends ("30°" / "90°") in Pond's numeral face, like the Power view's "20 W".
+local function axis(text)
+  return ui.label({ text = text, fontSize = 12, fontFamily = "IBM Plex Mono", color = "on_surface/0.5" })
+end
+
 -- Resample an 8-point curve onto an even temperature axis for the graph.
 function Fans.curveSamples(spec, t0, t1, n)
   if not spec then return {} end
@@ -109,12 +114,12 @@ function Fans.view()
       ui.graph({ height = 96, values = Fans.curveSamples(showCpu, 30, 90, 31), values2 = Fans.curveSamples(showGpu, 30, 90, 31),
         color = "primary", color2 = "tertiary", lineWidth = 2, fillOpacity = 0.12 }),
       ui.row({ align = "center", gap = 10 }, {
-        caption("30°"),
+        axis("30°"),
         ui.spacer({ flexGrow = 1 }),
         stat("point-filled", "CPU", "primary"),
         stat("point-filled", "GPU", "tertiary"),
         ui.spacer({ flexGrow = 1 }),
-        caption("90°"),
+        axis("90°"),
       }),
     }),
     section({

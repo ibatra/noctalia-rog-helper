@@ -15,7 +15,7 @@
 id = "ishaan/rog-helper"
 name = "ROG helper"
 version = "0.1.0"
-plugin_api = 30
+plugin_api = 43
 author = "ishaan"
 license = "MIT"
 dependencies = []
@@ -38,11 +38,12 @@ entry = "widget.luau"
 [[panel]]
 id = "panel"
 entry = "panel.luau"
-width = 340
-height = 520
-placement = "attached"
-position = "auto"
-open_near_click = true
+width = 316 # Pond panel width, the same as every other bottom-left panel
+height = "content" # the card hugs the main view: no empty strip above the nav row
+max_height = 640 # panel.luau MAX_H must match: room for notes under the main view; sub-views use 592 and scroll
+placement = "floating" # attached panels take the bar's opacity, and the Pond sidebar bar is invisible
+position = "bottom_left" # opened from the sidebar's lower half: pops out bottom-aligned, stacked with the Pond panels
+open_near_click = false
 
 [[shortcut]]
 id = "awake"

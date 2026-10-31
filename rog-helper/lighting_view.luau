@@ -42,7 +42,7 @@ end
 
 local SWATCHES = { "ffffff", "ff2a2a", "ff7a00", "28e070", "00d0ff", "3060ff", "a040ff" }
 
-local function swatch(key, hex, selected, onClick, glyph)
+local function swatch(key, hex, selected, onClick, glyph, size)
   if hex == "000000" then -- "off" for the second colour; black vanishes on OLED
     hex = nil
     glyph = selected and "check" or "x"
@@ -53,7 +53,8 @@ local function swatch(key, hex, selected, onClick, glyph)
     local dark = hex and (tonumber(hex:sub(1, 2), 16) * 0.3 + tonumber(hex:sub(3, 4), 16) * 0.59 + tonumber(hex:sub(5, 6), 16) * 0.11) > 140
     kids[1] = ui.glyph({ name = glyph or "check", size = 14, color = hex and (dark and "#000000" or "#ffffff") or "on_surface_variant" })
   end
-  return ui.column({ key = key, width = 24, height = 24, radius = 99, fill = fill, align = "center", justify = "center", onClick = onClick, onHover = hoverHandler(key) }, kids)
+  local d = size or 24
+  return ui.column({ key = key, width = d, height = d, radius = 99, fill = fill, align = "center", justify = "center", onClick = onClick, onHover = hoverHandler(key) }, kids)
 end
 
 local function colourRow(which, current, apply)
@@ -63,21 +64,28 @@ local function colourRow(which, current, apply)
   if themeHex then list[#list + 1] = themeHex end
   for _, h in ipairs(SWATCHES) do list[#list + 1] = h end
   if which == 2 then table.insert(list, 1, "000000") end
+  for _, h in ipairs(list) do
+    if current == h then seen = true end
+  end
+  local extra = (current and current ~= "" and not seen) and 1 or 0
+  -- the 316 px card fits nine 24 px swatches; ten or eleven (theme colour,
+  -- "off", a custom current colour) shrink to 22 px with tighter gaps
+  local count = #list + extra + 1
+  local size, gap = 24, 6
+  if count > 9 then size, gap = 22, 3 end
   for i, h in ipairs(list) do
-    local sel = current == h
-    if sel then seen = true end
-    kids[#kids + 1] = swatch("sw" .. which .. ":" .. i, h, sel, function() apply(h) end)
+    kids[#kids + 1] = swatch("sw" .. which .. ":" .. i, h, current == h, function() apply(h) end, nil, size)
   end
   -- current colour when it is none of the presets, then the picker
-  if current and current ~= "" and not seen then
-    kids[#kids + 1] = swatch("sw" .. which .. ":cur", current, true, nil)
+  if extra == 1 then
+    kids[#kids + 1] = swatch("sw" .. which .. ":cur", current, true, nil, nil, size)
   end
   kids[#kids + 1] = swatch("sw" .. which .. ":pick", nil, false, function()
     noctalia.openColorPicker("#" .. (current ~= "" and current or "ffffff"), function(color)
       if color then apply(color:gsub("#", ""):sub(1, 6):lower()) end
     end)
-  end, "color-picker")
-  return ui.row({ gap = 6, align = "center" }, kids)
+  end, "color-picker", size)
+  return ui.row({ gap = gap, align = "center" }, kids)
 end
 
 local EFFECTS = {
@@ -107,7 +115,9 @@ local function lightingKeyboard()
     if #parts == 0 then parts[1] = caption("No keyboard lighting controls on this model") end
     return parts
   end
-  parts[#parts + 1] = section({ iconRow("sparkles", choices("segment", "aura", effectOpts, cur)), noteRow("aura") })
+  -- five effects need the full width of the 316 px card ("Breathe" did not fit
+  -- beside an icon), so this track takes a label above instead
+  parts[#parts + 1] = section({ label("Effect"), choices("segment", "aura", effectOpts, cur), noteRow("aura") })
   if cur == "static" or cur == "breathe" or cur == "pulse" then
     parts[#parts + 1] = section({ label("Colour"), colourRow(1, c1, function(h) apply(cur, h) end) })
   end

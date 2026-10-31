@@ -15,7 +15,7 @@
 id = "ishaan/tailscale"
 name = "Tailscale"
 version = "0.1.0"
-plugin_api = 30
+plugin_api = 43
 author = "ishaan"
 license = "MIT"
 dependencies = []
@@ -30,8 +30,9 @@ entry = "widget.luau"
 [[panel]]
 id = "panel"
 entry = "panel.luau"
-width = 290
-height = 440
-placement = "attached"
-position = "auto"
-open_near_click = true
+width = 316 # Pond panel width, same as the Wi-Fi / Bluetooth panels
+height = "content" # the card hugs its rows, like the Pond Wi-Fi / Bluetooth panels
+max_height = 592 # same top edge as the ROG panel; panel.luau's MAX_H must match. Rows scroll past it
+placement = "floating" # attached panels take the bar's opacity, and the Pond sidebar bar is invisible
+position = "bottom_left" # opened from the sidebar's lower half: pops out bottom-aligned, stacked with the Pond panels
+open_near_click = false

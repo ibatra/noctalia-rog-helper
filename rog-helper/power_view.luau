@@ -81,31 +81,32 @@ function Power.view()
       label("CPU power limits", custom and "Custom" or "Firmware"),
       choices("segment", "plmode", modeTabs, mode),
       ui.row({ align = "center", gap = 8 }, {
-        ui.label({ text = "Sustained", fontSize = 12, color = "on_surface", width = 76 }),
+        ui.row({ width = 76, align = "center" }, { ui.label({ text = "Sustained", fontSize = 12, color = "on_surface" }) }), -- a fixed column so both tracks start together
         ui.slider({ key = "pl1:" .. mode, min = 5, max = max1, step = 1, value = d.pl1, flexGrow = 1, controlSize = "sm",
           onChange = function(v)
             d.pl1 = math.floor(tonumber(v) or d.pl1)
             if d.pl2 < d.pl1 then d.pl2 = d.pl1 end
             render()
           end }),
-        ui.label({ text = d.pl1 .. " W", fontSize = 12, color = "on_surface_variant", width = 44, textAlign = "end" }),
+        ui.label({ text = d.pl1 .. " W", fontSize = 12, fontFamily = "IBM Plex Mono", color = "on_surface/0.7", width = 44, textAlign = "end" }),
       }),
       ui.row({ align = "center", gap = 8 }, {
-        ui.label({ text = "Boost", fontSize = 12, color = "on_surface", width = 76 }),
+        ui.row({ width = 76, align = "center" }, { ui.label({ text = "Boost", fontSize = 12, color = "on_surface" }) }), -- a fixed column so both tracks start together
         ui.slider({ key = "pl2:" .. mode, min = 5, max = max2, step = 1, value = d.pl2, flexGrow = 1, controlSize = "sm",
           onChange = function(v)
             d.pl2 = math.floor(tonumber(v) or d.pl2)
             if d.pl1 > d.pl2 then d.pl1 = d.pl2 end
             render()
           end }),
-        ui.label({ text = d.pl2 .. " W", fontSize = 12, color = "on_surface_variant", width = 44, textAlign = "end" }),
+        ui.label({ text = d.pl2 .. " W", fontSize = 12, fontFamily = "IBM Plex Mono", color = "on_surface/0.7", width = 44, textAlign = "end" }),
       }),
       ui.row({ gap = 6, justify = "end" }, {
         ui.button({ text = "Reset", controlSize = "sm", variant = "ghost", enabled = custom or changed, onClick = function()
           drafts[mode] = nil
           act("rapl", "reset", { "rapl", "reset", mode }, "extra")
         end }),
-        ui.button({ text = "Apply", controlSize = "sm", variant = "secondary", enabled = changed and not busy.rapl, onClick = function()
+        -- Ghost while disabled: Noctalia's disabled secondary is a solid grey block.
+        ui.button({ text = "Apply", controlSize = "sm", variant = (changed and not busy.rapl) and "secondary" or "ghost", enabled = changed and not busy.rapl, onClick = function()
           act("rapl", "set", { "rapl", "set", mode, tostring(d.pl1), tostring(d.pl2) }, "extra")
           drafts[mode] = nil
         end }),

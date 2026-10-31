@@ -1,5 +1,6 @@
 --!nonstrict
--- ROG helper panel: G-Helper's one-glance layout in Noctalia's M3 surfaces.
+-- ROG helper panel: G-Helper's one-glance layout, drawn in Pond's design
+-- language (butterfly.so) like the shell's Wi-Fi / Bluetooth / battery panels.
 --
 -- Main view: header (battery, charger, CPU, dGPU), Performance, GPU, Screen,
 -- Battery limit, Keyboard, Awake, and a row that opens the Power, Fans,
@@ -211,31 +212,38 @@ end
 
 -- ── building blocks ───────────────────────────────────────────────────────────
 -- Two control families with a clear job each:
---   tiles  - the big mode switches (Performance, GPU): separate slabs, styled
---            like the Control Center's tiles.
---   tracks - every smaller choice: one pill track, the active option a
---            primary pill inside it, the rest bare text.
+--   tiles  - the big mode switches (Performance, GPU): separate slabs.
+--   tracks - every smaller choice: one rounded track, the active option a
+--            tinted segment inside it, the rest bare text.
 -- Labels are dropped wherever an icon or the options themselves say enough.
 --
--- Theme roles only, the ones Noctalia's own panels use, so the panel follows
--- the palette and sits on the shell's panel background: an active choice is
--- primary with on_primary content, everything else surface_variant, and a
--- hovered one hover with on_hover content.
+-- Pond's look: #262626 slabs with 12 px corners,
+-- #303030 under the pointer (never an accent fill), a sparing lavender for
+-- what is picked (Pond's selected battery profile: lavender at 10%, its icon
+-- in colour), Onest Medium with secondary text at 50-70%, #3D3D3D hairlines,
+-- serif titles. Palette roles, so the Pond palette supplies the greys.
 
-local R_TILE = 16
-local FILL_IDLE = "surface_variant" -- inactive tiles, tracks, chips, cards
-local FILL_HOVER = "hover"
-local FILL_ON = "primary"
+local R_TILE = 12
+local FILL_IDLE = "surface_container" -- Pond #262626: tiles, tracks, chips, cards
+local FILL_HOVER = "hover"            -- Pond #303030
+local FILL_ON = "primary/0.15"        -- lavender tint for the picked option
+local LINE_ON = "primary/0.4"         -- and its 1 px hairline (tiles, track segments, chips)
+local MONO = "IBM Plex Mono"          -- Pond's numeral face (readouts, temperatures, watts)
+local HAIRLINE = "outline_variant"    -- Pond #3D3D3D
+local TITLE_FONT = "Instrument Serif" -- stands in for Pond's Gramercy
+local ATTENTION = "#ff9f67"           -- Pond's orange
+-- Pond's pastel accents. A picked mode tile is tinted in its own colour, like
+-- Pond's power profiles: eco lime, balanced lavender, performance orange.
+local LIME, LAVENDER, ORANGE = "#cbe25b", "#cba6f7", "#ff9f67"
 -- Bare items (track options, nav buttons) still need an explicit fill: a nil
 -- fill leaves a retained node's previous fill in place, so a hover highlight
 -- would never clear.
-local FILL_NONE = "surface_variant/0.01"
+local FILL_NONE = "surface_container/0.01"
 
--- Content colour on a fill: on_primary on an active choice, on_hover on a
--- hovered one, otherwise `idle`.
+-- Content colour: full white on a picked or hovered option, otherwise `idle`
+-- (the 60% secondary text).
 local function ink(active, hovered, idle)
-  if active then return "on_primary" end
-  if hovered then return "on_hover" end
+  if active or hovered then return "on_surface" end
   return idle
 end
 
@@ -272,19 +280,23 @@ local function hoverHandler(key)
   end
 end
 
+-- "tertiary" is the warning tone the views pass (awake_view.luau and its
+-- tests); in the Pond palette tertiary is the success lime, so warnings take
+-- Pond's orange instead.
 local function caption(text, color)
-  return ui.label({ text = text, fontSize = 11, color = color or "on_surface_variant" })
+  if color == "tertiary" then color = ATTENTION end
+  return ui.label({ text = text, fontSize = 12, color = color or "on_surface/0.5", maxLines = 3 })
 end
 
 -- Sub-view section label, with optional trailing detail or node.
 local function label(title, trailing)
-  local kids = { ui.label({ text = title, fontSize = 12, color = "on_surface_variant", flexGrow = 1 }) }
+  local kids = { ui.label({ text = title, fontSize = 12, fontWeight = "medium", color = "on_surface/0.5", flexGrow = 1 }) }
   if type(trailing) == "string" and trailing ~= "" then
     kids[#kids + 1] = caption(trailing)
   elseif type(trailing) == "table" then
     kids[#kids + 1] = trailing
   end
-  return ui.row({ align = "center", gap = 8, height = 16 }, kids)
+  return ui.row({ align = "center", gap = 8, height = 18 }, kids)
 end
 
 local function tile(section, opt, selected)
@@ -292,16 +304,23 @@ local function tile(section, opt, selected)
   local active = opt.id == selected
   local enabled = opt.enabled ~= false and not busy[section]
   local hovered = not active and enabled and hover == key
-  local fill = active and FILL_ON or (hovered and FILL_HOVER or FILL_IDLE)
-  local color = ink(active, hovered, "on_surface")
+  -- The picked tile takes one accent throughout, like Pond's selected power
+  -- profile: the accent at ~15% for the fill, a hairline and the icon in the
+  -- accent itself. Its own tint (#rrggbb: Pond's profile colours on
+  -- Performance and GPU) or lavender. The rest stay white at 60%.
+  local onFill, onBorder, onGlyph = FILL_ON, LINE_ON, "primary"
+  if opt.tint then onFill, onBorder, onGlyph = opt.tint .. "26", opt.tint .. "66", opt.tint end -- 15% / 40%
+  local fill = active and onFill or (hovered and FILL_HOVER or FILL_IDLE)
+  local glyphColor = active and onGlyph or (hovered and "on_surface" or "on_surface/0.6")
   return ui.column({
-    key = key, flexGrow = 1, gap = 3, paddingV = 9, radius = R_TILE, fill = fill, align = "center",
+    key = key, flexGrow = 1, gap = 4, paddingV = 10, radius = R_TILE, fill = fill, align = "center",
+    border = active and onBorder or FILL_NONE, borderWidth = 1,
     opacity = (opt.enabled == false) and 0.35 or 1,
     onClick = enabled and not active and opt.onClick or nil,
     onHover = hoverHandler(key),
   }, {
-    ui.glyph({ name = opt.glyph, size = 19, color = color }),
-    ui.label({ text = opt.label, fontSize = 12, color = color }),
+    ui.glyph({ name = opt.glyph, size = 19, color = glyphColor }),
+    ui.label({ text = opt.label, fontSize = 12, fontWeight = "medium", color = ink(active, hovered, "on_surface/0.7"), maxLines = 1 }),
   })
 end
 
@@ -311,13 +330,17 @@ local function segment(section, opt, selected)
   local enabled = opt.enabled ~= false and not busy[section]
   local hovered = not active and enabled and hover == key
   local fill = active and FILL_ON or (hovered and FILL_HOVER or FILL_NONE)
+  -- The picked segment matches the picked tile and chip: the accent at 15%
+  -- with a 40% hairline. Every segment carries the 1 px border (invisible when
+  -- not picked) so picking one never shifts the track.
   return ui.row({
-    key = key, flexGrow = 1, paddingV = 6, radius = 99, fill = fill, justify = "center", align = "center",
+    key = key, flexGrow = 1, paddingV = 6, radius = 8, fill = fill, justify = "center", align = "center",
+    border = active and LINE_ON or FILL_NONE, borderWidth = 1,
     opacity = (opt.enabled == false) and 0.35 or 1,
     onClick = enabled and not active and opt.onClick or nil,
     onHover = hoverHandler(key),
   }, {
-    ui.label({ text = opt.label, fontSize = 12, color = ink(active, hovered, "on_surface_variant") }),
+    ui.label({ text = opt.label, fontSize = 12, fontWeight = "medium", color = ink(active, hovered, "on_surface/0.6") }),
   })
 end
 
@@ -327,28 +350,31 @@ local function choices(kind, section, options, selected)
     children[#children + 1] = (kind == "tile" and tile or segment)(section, o, selected)
   end
   if kind == "tile" then return ui.row({ gap = 6 }, children) end
-  return ui.row({ gap = 2, padding = 3, radius = 99, fill = FILL_IDLE }, children)
+  return ui.row({ gap = 2, padding = 3, radius = 10, fill = FILL_IDLE }, children)
 end
 
 -- A settings row whose leading glyph stands in for its label.
 local function iconRow(glyph, control, trailing)
   local kids = {
-    ui.column({ width = 22, align = "center" }, { ui.glyph({ name = glyph, size = 16, color = "on_surface_variant" }) }),
+    ui.column({ width = 22, align = "center" }, { ui.glyph({ name = glyph, size = 16, color = "on_surface/0.6" }) }),
     ui.column({ flexGrow = 1 }, { control }),
   }
   if trailing then kids[#kids + 1] = trailing end
   return ui.row({ align = "center", gap = 8 }, kids)
 end
 
--- Pill that toggles on its own (used for multi-select flags).
+-- Pill that toggles on its own (used for multi-select flags). On is the
+-- lavender tint with a lavender hairline (no check glyph: four of them did not
+-- fit the 316 px card); off keeps an invisible hairline so nothing shifts.
 local function chip(key, text, on, onClick)
   local hovered = not on and hover == key
   local fill = on and FILL_ON or (hovered and FILL_HOVER or FILL_IDLE)
-  local color = ink(on, hovered, "on_surface_variant")
-  local kids = {}
-  if on then kids[#kids + 1] = ui.glyph({ name = "check", size = 13, color = color }) end
-  kids[#kids + 1] = ui.label({ text = text, fontSize = 12, color = color })
-  return ui.row({ key = key, gap = 4, paddingH = 9, paddingV = 6, radius = 99, fill = fill, align = "center", onClick = onClick, onHover = hoverHandler(key) }, kids)
+  local color = ink(on, hovered, "on_surface/0.6")
+  return ui.row({ key = key, paddingH = 10, paddingV = 6, radius = 10, fill = fill, align = "center",
+    border = on and LINE_ON or FILL_NONE, borderWidth = 1,
+    onClick = onClick, onHover = hoverHandler(key) }, {
+    ui.label({ text = text, fontSize = 12, fontWeight = "medium", color = color, maxLines = 1 }),
+  })
 end
 
 local function noteRow(section, extra)
@@ -361,8 +387,8 @@ local function noteRow(section, extra)
   local children = {}
   if n then
     children[#children + 1] = ui.label({
-      text = n.text, fontSize = 11, maxLines = 2, flexGrow = 1,
-      color = n.tone == "error" and "error" or "on_surface_variant",
+      text = n.text, fontSize = 12, maxLines = 2, flexGrow = 1,
+      color = n.tone == "error" and "error" or "on_surface/0.6",
     })
   end
   if extra then children[#children + 1] = extra end
@@ -377,11 +403,15 @@ local function section(parts, gap)
   return ui.column({ gap = gap or 6 }, kids)
 end
 
-local function stat(glyph, text, color)
-  return ui.row({ gap = 4, align = "center" }, {
-    ui.glyph({ name = glyph, size = 13, color = color or "on_surface_variant" }),
-    ui.label({ text = text, fontSize = 11, color = color or "on_surface_variant" }),
-  })
+-- Optional `value` follows the word in the mono numeral face ("CPU" + "46°").
+local function stat(glyph, text, color, value)
+  local c = color or "on_surface/0.5"
+  local kids = {
+    ui.glyph({ name = glyph, size = 13, color = c }),
+    ui.label({ text = text, fontSize = 12, color = c }),
+  }
+  if value then kids[#kids + 1] = ui.label({ text = value, fontSize = 12, fontFamily = MONO, color = c }) end
+  return ui.row({ gap = 4, align = "center" }, kids)
 end
 
 -- ── main view ─────────────────────────────────────────────────────────────────
@@ -392,7 +422,7 @@ end
 -- gives way to a caption of the same height.
 local function drawTrace()
   if st.battery_status ~= "Discharging" then
-    return ui.column({ height = 30, justify = "center", align = "center" }, { caption("Power draw shows on battery") })
+    return ui.column({ height = 30, justify = "center", align = "start" }, { caption("Power draw shows on battery") })
   end
   local hist = noctalia.state.get("rog.draw") or {}
   local peak = 30
@@ -404,7 +434,7 @@ local function drawTrace()
   local ceiling = {}
   for i = 1, #vals do ceiling[i] = 1 end
   return ui.graph({ height = 30, values = vals, values2 = ceiling,
-    color = dgpuActive() and "tertiary" or "primary", color2 = "primary/0", lineWidth = 1.5, fillOpacity = 0.14 })
+    color = dgpuActive() and ATTENTION or "primary", color2 = "primary/0", lineWidth = 1.5, fillOpacity = 0.14 })
 end
 
 -- The battery's rate is the machine's draw only while discharging. Charging,
@@ -414,21 +444,29 @@ local function header()
   local status = st.battery_status
   local rate = nil
   if status == "Discharging" then
-    rate = ui.label({ text = string.format("%.1f W", w), fontSize = 13, fontWeight = "medium", color = "primary" })
+    rate = ui.label({ text = string.format("%.1f W", w), fontSize = 12, fontFamily = MONO, fontWeight = "medium", color = "primary" })
   elseif status == "Charging" and w > 0 then
-    rate = ui.label({ text = string.format("Charging +%.0f W", w), fontSize = 11, color = "on_surface_variant" })
+    rate = ui.row({ gap = 4, align = "end" }, { -- Pond's charging lime; the figure in the mono numeral face
+      ui.label({ text = "Charging", fontSize = 12, color = "#cbe25b" }),
+      ui.label({ text = string.format("+%.0f W", w), fontSize = 12, fontFamily = MONO, color = "#cbe25b" }),
+    })
   end
   return ui.column({ gap = 6 }, {
     ui.row({ align = "end", gap = 8 }, {
-      ui.label({ text = st.battery and `{st.battery}%` or "", fontSize = 20, fontWeight = "light", color = "on_surface" }),
-      ui.label({ text = chargerText() or "On battery", fontSize = 11, color = "on_surface_variant", flexGrow = 1 }),
-      rate,
+      -- Pond's big numbers are its serif display face
+      ui.label({ text = st.battery and `{st.battery}%` or "", fontFamily = TITLE_FONT, fontSize = 30, color = "on_surface" }),
+      -- paddingV 7 lifts the small text onto the serif number's baseline
+      -- (bottom-aligned boxes left it 7 units low: the serif's descent)
+      ui.row({ flexGrow = 1, paddingV = 7, gap = 8, align = "end" }, {
+        ui.label({ text = chargerText() or "On battery", fontSize = 12, color = "on_surface/0.5", flexGrow = 1 }),
+        rate,
+      }),
     }),
     drawTrace(),
     ui.row({ align = "center", gap = 12 }, {
-      st.cpu_temp and stat("temperature", `CPU {st.cpu_temp}°`) or ui.spacer({}),
+      st.cpu_temp and stat("temperature", "CPU", nil, `{st.cpu_temp}°`) or ui.spacer({}),
       ui.spacer({ flexGrow = 1 }),
-      stat("device-desktop", dgpuText(), dgpuActive() and "tertiary" or nil),
+      stat("device-desktop", dgpuText(), dgpuActive() and ATTENTION or nil),
     }),
   })
 end
@@ -438,9 +476,10 @@ local function perfSection()
   local function pick(id) return function() act("perf", id, { "perf", id }) end end
   return section({
     choices("tile", "perf", {
-      { id = "silent", label = "Silent", glyph = "feather", onClick = pick("silent") },
-      { id = "balanced", label = "Balanced", glyph = "scale", onClick = pick("balanced") },
-      { id = "turbo", label = "Turbo", glyph = "rocket", onClick = pick("turbo") },
+      -- Pond's power profile colours: eco lime, balanced lavender, performance orange
+      { id = "silent", label = "Silent", glyph = "feather", tint = LIME, onClick = pick("silent") },
+      { id = "balanced", label = "Balanced", glyph = "scale", tint = LAVENDER, onClick = pick("balanced") },
+      { id = "turbo", label = "Turbo", glyph = "rocket", tint = ORANGE, onClick = pick("turbo") },
     }, sel),
     noteRow("perf"),
   })
@@ -469,14 +508,15 @@ local function gpuSection()
 
   local opts = {}
   if canOff then
-    opts[#opts + 1] = { id = "eco", label = "Eco", glyph = "leaf", enabled = not ult, onClick = pick("eco") }
+    opts[#opts + 1] = { id = "eco", label = "Eco", glyph = "leaf", tint = LIME, enabled = not ult, onClick = pick("eco") }
   end
-  opts[#opts + 1] = { id = "standard", label = "Standard", glyph = "device-laptop", onClick = pick("standard") }
+  -- the same energy scale as Performance: saving lime, everyday lavender, all-out orange
+  opts[#opts + 1] = { id = "standard", label = "Standard", glyph = "device-laptop", tint = LAVENDER, onClick = pick("standard") }
   if canOff then
-    opts[#opts + 1] = { id = "optimized", label = "Optimized", glyph = "sparkles", enabled = not ult, onClick = pick("optimized") }
+    opts[#opts + 1] = { id = "optimized", label = "Optimized", glyph = "sparkles", tint = LAVENDER, enabled = not ult, onClick = pick("optimized") }
   end
   if canMux then
-    opts[#opts + 1] = { id = "ultimate", label = "Ultimate", glyph = "bolt", onClick = pick("ultimate") }
+    opts[#opts + 1] = { id = "ultimate", label = "Ultimate", glyph = "bolt", tint = ORANGE, onClick = pick("ultimate") }
   end
   return section({ choices("tile", "gpu", opts, sel), noteRow("gpu", restart) })
 end
@@ -539,9 +579,9 @@ end
 
 local function navButton(id, glyph, text)
   local key = "nav:" .. id
-  local color = ink(false, hover == key, "on_surface_variant")
+  local color = ink(false, hover == key, "on_surface/0.6")
   return ui.row({
-    key = key, flexGrow = 1, gap = 6, paddingV = 7, radius = 99,
+    key = key, flexGrow = 1, gap = 6, paddingV = 8, radius = 10,
     fill = hover == key and FILL_HOVER or FILL_NONE, justify = "center", align = "center",
     onClick = function()
       view = id
@@ -552,7 +592,26 @@ local function navButton(id, glyph, text)
     onHover = hoverHandler(key),
   }, {
     ui.glyph({ name = glyph, size = 15, color = color }),
-    ui.label({ text = text, fontSize = 12, color = color }),
+    ui.label({ text = text, fontSize = 12, fontWeight = "medium", color = color }),
+  })
+end
+
+local function hairline(key)
+  return ui.row({ key = key, height = 1, fill = HAIRLINE }, { ui.spacer({ flexGrow = 1 }) })
+end
+
+-- Pond's panel header: a serif title (a back button first on a sub-view, a
+-- detail on the right) over a hairline.
+local function titleBlock(key, title, detail, back)
+  local kids = {}
+  if back then kids[#kids + 1] = back end
+  kids[#kids + 1] = ui.label({ text = title, fontFamily = TITLE_FONT, fontSize = 22, color = "on_surface", maxLines = 1, flexGrow = 1 })
+  if detail and detail ~= "" then
+    kids[#kids + 1] = ui.label({ text = detail, fontSize = 12, color = "on_surface/0.5", maxLines = 1, maxWidth = 170, textAlign = "end" })
+  end
+  return ui.column({ key = key, gap = 12, paddingH = 2 }, {
+    ui.row({ height = 32, align = "center", gap = 10 }, kids),
+    hairline(key .. ":line"),
   })
 end
 
@@ -568,37 +627,73 @@ end
 
 local function mainView()
   return {
+    titleBlock("title:main", "Laptop"),
     header(),
     ui.column({ gap = 8 }, packed(perfSection(), gpuSection())),
     ui.column({ gap = 8 }, packed(screenSection(), batterySection(), keyboardSection(), Awake.mainRow(), noteRow("awake_quick"))),
-    ui.row({ gap = 4 }, {
-      navButton("power", "gauge", "Power"),
-      navButton("fans", "propeller", "Fans"),
-      navButton("lighting", "bulb", "Lighting"),
-      navButton("sleep", "moon", "Sleep"),
+    ui.column({ gap = 8 }, {
+      hairline("nav:line"),
+      ui.row({ gap = 4 }, {
+        navButton("power", "gauge", "Power"),
+        navButton("fans", "propeller", "Fans"),
+        navButton("lighting", "bulb", "Lighting"),
+        navButton("sleep", "moon", "Sleep"),
+      }),
     }),
   }
 end
 
 -- ── sub-view chrome ───────────────────────────────────────────────────────────
 
+-- Pond's back button: 32x32, 10 px corners, #262626 with a hairline.
 local function subHeader(title, detail)
-  return ui.row({ align = "center", gap = 6 }, {
-    ui.button({ glyph = "chevron-left", variant = "ghost", controlSize = "sm", onClick = function()
+  local hovered = hover == "back"
+  local back = ui.row({
+    key = "back", width = 32, height = 32, radius = 10, align = "center", justify = "center",
+    fill = hovered and FILL_HOVER or FILL_IDLE, border = HAIRLINE, borderWidth = 1,
+    onClick = function()
       view = "main"
       hover = ""
       render()
-    end }),
-    ui.label({ text = title, fontSize = 14, fontWeight = "semibold", color = "on_surface", flexGrow = 1 }),
-    caption(detail or ""),
+    end,
+    onHover = hoverHandler("back"),
+  }, { ui.glyph({ name = "chevron-left", size = 16, color = "on_surface" }) })
+  return titleBlock("title:" .. title, title, detail, back)
+end
+
+-- Pond's toggle: a 54x28 outlined pill with faint off/on markers; the knob is
+-- red with a dash when off and green with a bar when on (Pond's literals).
+-- The whole row is the click target; onChange gets "true"/"false" like
+-- ui.toggle's.
+local function pondToggle(on, hovered)
+  local knob = ui.column({ width = 24, height = 24, radius = 12, align = "center", justify = "center",
+    fill = on and "#0c3723" or "#613129" }, {
+    on and ui.box({ width = 4, height = 12, radius = 2, fill = "#b0ff4f" })
+      or ui.box({ width = 12, height = 4, radius = 2, fill = "#fb9b89" }),
   })
+  local ghostOff = ui.row({ width = 24, height = 24, align = "center", justify = "center" }, {
+    ui.box({ width = 13, height = 5, radius = 2.5, fill = FILL_NONE, border = "#e7e7e74d", borderWidth = 1 }),
+  })
+  local ghostOn = ui.row({ width = 24, height = 24, align = "center", justify = "center" }, {
+    ui.box({ width = 5, height = 13, radius = 2.5, fill = FILL_NONE, border = "#e7e7e74d", borderWidth = 1 }),
+  })
+  return ui.row({
+    width = 54, height = 28, radius = 14, padding = 2, gap = 2, align = "center",
+    fill = hovered and FILL_HOVER or FILL_NONE, border = HAIRLINE, borderWidth = 1,
+  }, on and { ghostOff, knob } or { knob, ghostOn })
 end
 
 local function toggleRow(title, checked, onChange, detail)
-  local kids = { ui.label({ text = title, fontSize = 12, color = "on_surface", flexGrow = 1 }) }
+  local key = "toggle:" .. title
+  local hovered = hover == key
+  local kids = { ui.label({ text = title, fontSize = 13, fontWeight = "medium", color = "on_surface", flexGrow = 1, maxLines = 1 }) }
   if detail then kids[#kids + 1] = caption(detail) end
-  kids[#kids + 1] = ui.toggle({ checked = checked, onChange = onChange })
-  return ui.row({ align = "center", gap = 8 }, kids)
+  kids[#kids + 1] = pondToggle(checked, hovered)
+  return ui.row({
+    key = key, align = "center", gap = 8, height = 36, radius = 12, -- no inset: label and toggle share the edges of the sliders and selectors
+    onClick = function() onChange(checked and "false" or "true") end,
+    onHover = hoverHandler(key),
+  }, kids)
 end
 
 -- The Sleep view and the main-view Awake row are drawn by awake_view.luau from
@@ -637,10 +732,61 @@ Lighting.setup(blocks)
 
 -- ── render / lifecycle ────────────────────────────────────────────────────────
 
--- The panel has a fixed height (plugin.toml) and clips whatever doesn't fit,
--- and rows come and go (notes, Restart, the Awake row, With monitor). So every
--- view keeps its header, and the main view its Power/Fans/Lighting/Sleep row,
--- in place and scrolls the rest when it runs taller than the panel.
+-- The panel is height = "content" (plugin.toml): the card hugs the main view
+-- and grows up from the bottom-left corner it is pinned to, so there is no
+-- empty strip above the nav row when no note or Restart row shows. A ui.scroll
+-- has no natural height of its own, so the main view's rows only go in one
+-- when they would run past the card's maximum; then a fixed-height column
+-- holds it, header and nav row staying put. The sub-views are long (Sleep,
+-- Lighting), so they always take a fixed card (the old 592) and scroll; the
+-- main view may grow a little past that while notes show.
+local MAX_H = 640    -- plugin.toml max_height
+local SUB_H = 592    -- the sub-views' card
+local PANEL_PAD = 14 -- Noctalia's padding on each side of the content
+local ROOT_GAP = 14  -- between the header, the rows and the nav row
+-- a little over the real heights (Onest's line is 1.275 em, the serif's 1.3):
+-- header = 32 row + 12 + hairline; nav = hairline + 8 + 8/15/8 button;
+-- dry-run caption = one 12 px line + the gap
+local HEAD_H, FOOT_H, DRY_H = 46, 42, 30
+-- main-view rows with every section present and no notes: the battery
+-- header (39 + 6 + 30 + 6 + 15), two 58 tile rows, four 33 tracks and the
+-- gaps come to 406; round 2's screenshot measured about 402
+local MAIN_ROWS_H = 410
+local NOTE_LINE = 16 -- one 12 px line
+local RESTART_H = 14 -- the Restart button over its note's one line
+
+-- ui.scroll insets its viewport by a fixed 4 px left/right and 8 px top/bottom
+-- in surface pixels (not scaled by ui_scale), so
+-- the plain column gets the same inset and nothing shifts between the two.
+local function readUiScale()
+  for _, p in ipairs({ "~/.local/state/noctalia/settings.toml", "~/.config/noctalia/config.toml" }) do
+    local ok, s = pcall(noctalia.readFile, noctalia.expandPath(p))
+    if ok and type(s) == "string" then
+      local v = tonumber(s:match("\n%s*ui_scale%s*=%s*([%d%.]+)") or s:match("^%s*ui_scale%s*=%s*([%d%.]+)") or "")
+      if v and v > 0.3 and v < 4 then return v end
+    end
+  end
+  return 1
+end
+local UI_SCALE = readUiScale()
+local SCROLL_PAD_H = 4 / UI_SCALE
+local SCROLL_PAD_V = 8 / UI_SCALE
+
+-- Estimated natural height of the main view's rows: the base plus whatever
+-- notes and the Restart row add right now (an over-estimate only switches to
+-- the scrolling layout a little early).
+local function mainRowsHeight()
+  local h = MAIN_ROWS_H + 2 * SCROLL_PAD_V
+  local now = noctalia.nowMs()
+  for _, n in pairs(notes) do
+    if not (n.expires and now > n.expires) then
+      h += 8 + NOTE_LINE * (#(n.text or "") > 38 and 2 or 1)
+    end
+  end
+  if needsRestart() then h += RESTART_H end
+  return h
+end
+
 render = function()
   local body
   if view == "power" then body = Power.view()
@@ -654,10 +800,24 @@ render = function()
   end
   local head = table.remove(items, 1)
   local foot = view == "main" and table.remove(items) or nil
-  local dry = noctalia.getConfig("dry_run") == true and caption("Dry run: buttons only show their commands", "tertiary") or nil
-  local kids = packed(dry, head, #items > 0 and ui.scroll({ flexGrow = 1, gap = 14 }, items) or nil, foot)
+  local dry = noctalia.getConfig("dry_run") == true and caption("Dry run: buttons only show their commands", ATTENTION) or nil
+
+  local room = (view == "main" and MAX_H or SUB_H) - 2 * PANEL_PAD - HEAD_H - ROOT_GAP
+  if foot then room -= (FOOT_H + ROOT_GAP) end
+  if dry then room -= DRY_H end
+  local rows = nil
+  if #items > 0 then
+    if view == "main" and mainRowsHeight() <= room then
+      rows = ui.column({ key = "rows:plain", gap = 14, paddingH = SCROLL_PAD_H, paddingV = SCROLL_PAD_V }, items)
+    else
+      rows = ui.column({ key = "rows:box", height = room }, {
+        ui.scroll({ key = "rows:scroll", flexGrow = 1, gap = 14 }, items),
+      })
+    end
+  end
+  local kids = packed(dry, head, rows, foot)
   -- keyed by view so retained nodes never carry props across views
-  panel.render(ui.column({ flexGrow = 1, gap = 14 }, { ui.column({ key = "view:" .. view, flexGrow = 1, gap = 14 }, kids) }))
+  panel.render(ui.column({ gap = ROOT_GAP }, { ui.column({ key = "view:" .. view, gap = ROOT_GAP }, kids) }))
 end
 
 -- The dry_run setting reaches the systemd units through a flag file (the bar
