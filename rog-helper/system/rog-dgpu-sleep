@@ -1,0 +1,36 @@
+#!/bin/sh
+# rog-dgpu-sleep - systemd sleep hook from the ROG helper Noctalia plugin.
+#
+# In Eco (dgpu_disable=1) the NVIDIA dGPU is powered off but stays on the PCI
+# bus. On resume the kernel waits ~65 s for it to answer before giving up
+# ("pci 0000:01:00.0: not ready 65535ms after resume"), so the screen stays
+# black for a minute after opening the lid. Taking it off the bus before sleep
+# skips that wait; a rescan after resume puts back whatever answers.
+#
+# Install: sudo install -m755 system/rog-dgpu-sleep /usr/lib/systemd/system-sleep/
+
+FA=/sys/class/firmware-attributes/asus-armoury/attributes
+MARK=/run/rog-dgpu-removed
+
+case "$1" in
+  pre)
+    [ "$(cat "$FA/dgpu_disable/current_value" 2>/dev/null)" = 1 ] || exit 0
+    for d in /sys/bus/pci/devices/*; do
+      [ "$(cat "$d/vendor" 2>/dev/null)" = 0x10de ] || continue
+      # never pull a GPU a driver is using (the audio function is fine)
+      case "$(cat "$d/class")" in 0x03*) [ -e "$d/driver" ] && exit 0 ;; esac
+    done
+    for d in /sys/bus/pci/devices/*; do
+      [ "$(cat "$d/vendor" 2>/dev/null)" = 0x10de ] || continue
+      echo "rog-dgpu-sleep: removing ${d##*/} (dGPU off)"
+      echo 1 > "$d/remove" && touch "$MARK"
+    done
+    ;;
+  post)
+    [ -e "$MARK" ] || exit 0
+    rm -f "$MARK"
+    echo "rog-dgpu-sleep: rescanning PCI"
+    echo 1 > /sys/bus/pci/rescan
+    ;;
+esac
+exit 0
