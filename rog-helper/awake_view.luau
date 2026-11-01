@@ -1,5 +1,6 @@
 --!nonstrict
--- Sleep & lid: the panel's Sleep sub-view and the Awake row on the main view.
+-- Awake & lid: the panel's Awake sub-view (view id "sleep", kept for IPC) and
+-- the Awake row on the main view.
 --
 -- Reads `awakectl status` and changes things only through awakectl (the
 -- panel's actAwake), so this file holds no lid, lock or power logic. The
@@ -107,8 +108,8 @@ end
 local function batteryRow(s)
   local saved = tonumber(B.picked.stop_battery or s.stop_battery or "") or 0
   local value = batteryDraft or saved
-  return ui.row({ align = "center", gap = 8 }, {
-    ui.label({ text = "Battery below", fontSize = 12, color = "on_surface" }),
+  return ui.row({ align = "center", gap = 8, paddingH = B.TEXT_PAD }, { -- on the text edges, like the toggle rows
+    ui.label({ text = "Battery below", fontSize = 13, color = "on_surface" }),
     ui.slider({ key = "awake:stop_battery", min = 0, max = 50, step = 5, value = value, flexGrow = 1, controlSize = "sm",
       onChange = function(v)
         batteryDraft = math.floor(tonumber(v) or value)
@@ -123,7 +124,7 @@ local function batteryRow(s)
           B.render()
         end
       end }),
-    ui.label({ text = value == 0 and "Off" or (value .. "%"), fontSize = 12, fontFamily = "IBM Plex Mono", color = "on_surface/0.7", width = 36, textAlign = "end" }),
+    ui.label({ text = value == 0 and "Off" or (value .. "%"), fontSize = 13, fontFamily = "IBM Plex Mono", color = "on_surface/0.7", width = 36, textAlign = "end" }),
   })
 end
 
@@ -177,7 +178,7 @@ end
 
 function Awake.view()
   local s = snap
-  if not s then return { B.subHeader("Sleep & lid"), B.caption("Reading…") } end
+  if not s then return { B.subHeader("Awake & lid"), B.caption("Reading…") } end
   local mins = (s.mins or "") ~= "" and s.mins or "60" -- 0 = until stopped
   local function start(kind) return function() B.act("awake_kind", kind, { "start", kind, mins }) end end
 
@@ -204,7 +205,9 @@ function Awake.view()
     B.section({
       B.label("Lid closed"),
       B.iconRow("plug", setting("lid_ac", { { "sleep", "Sleep" }, { "awake", "Stay awake" } })),
-      B.iconRow("battery-2", setting("lid_bat", { { "sleep", "Sleep" }, { "session", "While awake" }, { "awake", "Stay awake" } })),
+      -- "If awake" (an Awake session is on): "While awake" ran into its
+      -- neighbours even at 12 in a third of the track beside the glyph
+      B.iconRow("battery-2", setting("lid_bat", { { "sleep", "Sleep" }, { "session", "If awake" }, { "awake", "Stay awake" } })),
       B.iconRow("device-laptop-off", setting("lid_screen", { { "off", "Off" }, { "lock", "Off + lock" } })),
       hasExt and B.iconRow("device-desktop", setting("lid_monitor", { { "dpms", "Turn off" }, { "disable", "Move windows" } })) or nil,
       hasExt and monitor == "disable" and B.caption("Experimental on this Hyprland: removing a screen can close apps", "tertiary") or nil,
@@ -223,7 +226,7 @@ function Awake.view()
     footer(s)
   )
   -- the panel keeps the header in place and scrolls the rest
-  table.insert(body, 1, B.subHeader("Sleep & lid", headline(s)))
+  table.insert(body, 1, B.subHeader("Awake & lid", headline(s)))
   return body
 end
 

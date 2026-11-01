@@ -1,6 +1,6 @@
 --!nonstrict
 -- Helpers shared by the panel, the bar widget, the Control Center tile and
--- the Sleep & lid view: required as require("./common.luau").
+-- the Awake & lid view: required as require("./common.luau").
 --
 -- Kept to the Lua 5.4 subset of Luau so the headless tests can load it.
 

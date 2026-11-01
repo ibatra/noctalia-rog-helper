@@ -8,7 +8,7 @@ local Lighting = {}
 local B = nil
 local st, ex = {}, {} -- the panel's rogctl status / status-extra, fresh each render
 local picked
-local num, has, act, render, hoverHandler, FILL_IDLE, kbdOptions
+local num, has, act, render, hoverHandler, FILL_IDLE, kbdOptions, TEXT_PAD
 local caption, label, section, choices, iconRow, chip, noteRow, toggleRow, subHeader, loadingView
 
 local lightTab = "keyboard" -- keyboard | slash
@@ -18,7 +18,7 @@ function Lighting.setup(blocks)
   B = blocks
   picked = B.picked
   num, has, act, render, hoverHandler = B.num, B.has, B.act, B.render, B.hoverHandler
-  FILL_IDLE, kbdOptions = B.FILL_IDLE, B.kbdOptions
+  FILL_IDLE, kbdOptions, TEXT_PAD = B.FILL_IDLE, B.kbdOptions, B.TEXT_PAD
   caption, label, section, choices, iconRow = B.caption, B.label, B.section, B.choices, B.iconRow
   chip, noteRow, toggleRow, subHeader, loadingView = B.chip, B.noteRow, B.toggleRow, B.subHeader, B.loadingView
 end
@@ -26,6 +26,10 @@ end
 -- Keyboard | Slash and more (IPC: tab keyboard|slash).
 function Lighting.setTab(tab)
   lightTab = tab
+end
+
+function Lighting.tab()
+  return lightTab
 end
 
 -- Theme primary as RRGGBB, from the palette Noctalia writes for Hyprland:
@@ -68,11 +72,11 @@ local function colourRow(which, current, apply)
     if current == h then seen = true end
   end
   local extra = (current and current ~= "" and not seen) and 1 or 0
-  -- the 316 px card fits nine 24 px swatches; ten or eleven (theme colour,
-  -- "off", a custom current colour) shrink to 22 px with tighter gaps
+  -- the 268 px text column fits nine 24 px swatches; ten or eleven (theme
+  -- colour, "off", a custom current colour) shrink to 22 px with 2 px gaps
   local count = #list + extra + 1
   local size, gap = 24, 6
-  if count > 9 then size, gap = 22, 3 end
+  if count > 9 then size, gap = 22, 2 end
   for i, h in ipairs(list) do
     kids[#kids + 1] = swatch("sw" .. which .. ":" .. i, h, current == h, function() apply(h) end, nil, size)
   end
@@ -162,14 +166,15 @@ local function lightingSlash()
       ui.select({ options = modes, selectedIndex = modeIdx, controlSize = "sm", flexGrow = 1,
         onChange = function(_i, text) act("slash_mode", text, { "slash", "mode", text }, "extra") end }),
     })
-    parts[#parts + 1] = ui.row({ align = "center", gap = 8 }, {
-      ui.label({ text = "Brightness", fontSize = 12, color = "on_surface", width = 76 }),
+    -- slider rows: the name on the text edge, like the Power view's
+    parts[#parts + 1] = ui.row({ align = "center", gap = 8, paddingH = TEXT_PAD }, {
+      ui.label({ text = "Brightness", fontSize = 13, color = "on_surface", width = 76 }),
       ui.slider({ key = "slashb", min = 0, max = 255, step = 5, value = bright, flexGrow = 1, controlSize = "sm",
         onChange = function(v) ex.slash_brightness = tostring(math.floor(tonumber(v) or bright)) end,
         onDragEnd = function() act("slash_b", "b", { "slash", "brightness", ex.slash_brightness }, "extra") end }),
     })
-    parts[#parts + 1] = ui.row({ align = "center", gap = 8 }, {
-      ui.label({ text = "Interval", fontSize = 12, color = "on_surface", width = 76 }),
+    parts[#parts + 1] = ui.row({ align = "center", gap = 8, paddingH = TEXT_PAD }, {
+      ui.label({ text = "Interval", fontSize = 13, color = "on_surface", width = 76 }),
       ui.slider({ key = "slashi", min = 0, max = 5, step = 1, value = num(ex.slash_interval) or 0, flexGrow = 1, controlSize = "sm",
         onChange = function(v) ex.slash_interval = tostring(math.floor(tonumber(v) or 0)) end,
         onDragEnd = function() act("slash_i", "i", { "slash", "interval", ex.slash_interval }, "extra") end }),

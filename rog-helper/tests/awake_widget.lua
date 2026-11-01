@@ -1,4 +1,4 @@
--- Headless tests for widget.luau's and shortcut.luau's Sleep & lid dot,
+-- Headless tests for widget.luau's and shortcut.luau's Awake & lid dot,
 -- tooltip and tile logic, run under plain Lua 5.4:
 --   lua rog-helper/tests/awake_widget.lua
 -- Each script is loaded with its own isolated _ENV (falling back to the real
@@ -200,7 +200,7 @@ do
   -- onRightClick: panel-open with the sleep context (togglePanel has none)
   nc.runs = {}
   env.onRightClick()
-  eq("onRightClick opens the Sleep view via IPC", "noctalia msg panel-open ishaan/rog-helper:panel sleep", args(nc.runs[1] and nc.runs[1].argv))
+  eq("onRightClick opens the Awake view via IPC", "noctalia msg panel-open ishaan/rog-helper:panel sleep", args(nc.runs[1] and nc.runs[1].argv))
 
   -- external rog.awake publish updates the tile without a subprocess
   nc.runs = {}

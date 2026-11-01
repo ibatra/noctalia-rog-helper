@@ -1,7 +1,10 @@
 --!nonstrict
 -- Tailscale bar widget: the dot grid, dimmed while disconnected, with a
--- small dot while an exit node carries the traffic. Polls every 10 s and
--- repaints at once when the panel publishes a new `ts.status`.
+-- small lime dot while an exit node carries the traffic (lime, Pond's
+-- "connected", not lavender: the notifications bell's unread dot sits one
+-- card over in lavender, and this one must not read as a second one).
+-- Polls every 10 s and repaints at once when the panel publishes a new
+-- `ts.status`.
 
 local Common = require("./common.luau")
 
@@ -13,7 +16,7 @@ local function render()
   local container = barWidget.isVertical() and ui.column or ui.row
   local glyph = ui.glyph({ name = "grid-dots", color = "on_surface" })
   local kids = { glyph }
-  if exit then kids[#kids + 1] = ui.box({ width = 5, height = 5, radius = 3, fill = "primary" }) end
+  if exit then kids[#kids + 1] = ui.box({ width = 5, height = 5, radius = 3, fill = "tertiary" }) end
   barWidget.render(container({ gap = 0, align = "start", opacity = running and 1 or 0.45 }, kids))
 
   if type(st) ~= "table" then

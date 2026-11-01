@@ -13,7 +13,8 @@ local PLUGIN_DIR = noctalia.pluginDir() or noctalia.expandPath("~/.local/share/n
 local AWAKECTL = PLUGIN_DIR .. "/bin/awakectl"
 local Common = require("./common.luau")
 
-local GLYPH = { silent = "feather", balanced = "scale", turbo = "rocket" }
+-- the tabler glyphs nearest the panel's Pond profile icons (leaf / person / gauge)
+local GLYPH = { silent = "leaf", balanced = "scale", turbo = "gauge" }
 local PERF_LABEL = { silent = "Silent", balanced = "Balanced", turbo = "Turbo" }
 
 local asusProfile -- resolved once: the asus-wmi platform-profile handler
@@ -66,7 +67,7 @@ end
 local function gpuText()
   if read(FA .. "dgpu_disable/current_value") == "1" then return "Eco, dGPU off" end
   if dgpuPath == nil or not noctalia.fileExists(dgpuPath) then dgpuPath = resolveDgpu() end
-  local mode = read(FA .. "gpu_mux_mode/current_value") == "0" and "Ultimate" or "Standard"
+  local mode = read(FA .. "gpu_mux_mode/current_value") == "0" and "Ultimate" or "Hybrid"
   if not dgpuPath then return mode end
   -- runtime_status only means something with a driver bound
   if not noctalia.fileExists(dgpuPath .. "/driver") then
@@ -171,7 +172,7 @@ local function sampleDraw()
   noctalia.state.set("rog.draw", copy)
 end
 
--- Publishes `rog.awake` for the panel's Sleep view and the Control Center
+-- Publishes `rog.awake` for the panel's Awake view and the Control Center
 -- tile, at most once per 9 s across every bar instance: the shared
 -- `rog.awakeAt` timestamp, same pattern as `rog.drawAt` above.
 local function refreshAwake()

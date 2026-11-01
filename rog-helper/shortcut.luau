@@ -1,6 +1,6 @@
 --!nonstrict
--- Control Center tile: "Stay awake" toggles the last-used Sleep & lid
--- session (bin/awakectl toggle). Right-click opens the panel's Sleep view.
+-- Control Center tile: "Stay awake" toggles the last-used Awake & lid
+-- session (bin/awakectl toggle). Right-click opens the panel's Awake view.
 --
 -- Reads the `rog.awake` snapshot the bar widget and the panel already keep
 -- fresh; it only runs `awakectl status` itself when nothing has published
@@ -65,6 +65,6 @@ end
 
 function onRightClick()
   -- noctalia.togglePanel takes only a panel id, no context argument, so open
-  -- the Sleep view through the IPC form instead, which does take one.
+  -- the Awake view through the IPC form instead, which does take one.
   noctalia.runAsync({ "noctalia", "msg", "panel-open", PANEL, "sleep" })
 end

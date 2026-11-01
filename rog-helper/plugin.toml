@@ -1,14 +1,18 @@
 # ROG helper - a G-Helper-style control panel for ASUS ROG laptops.
 #
-# bar   -> glyph for the current performance mode, with a small dot while a
-#          Sleep & lid session is running; click opens the panel.
+# bar   -> glyph for the current performance mode, with a small dot while an
+#          Awake & lid session is running; click opens the panel.
 #          Reads sysfs directly every 10 s (no subprocess, never wakes the dGPU).
-# panel -> Performance / GPU / Screen / Battery limit / Keyboard rows, plus a
-#          Sleep view (lid rules, the power key, stop conditions). Every
-#          action goes through bin/rogctl (bin/awakectl for Sleep & lid):
-#          asusctl, powerprofilesctl, hyprctl, systemd-inhibit.
+# panel -> Performance / GPU / Screen / Battery limit / Keyboard rows, plus
+#          Power, Fans, Lighting and Awake views (the Awake view: lid rules,
+#          the power key, stop conditions). Every action goes through
+#          bin/rogctl (bin/awakectl for Awake & lid): asusctl,
+#          powerprofilesctl, hyprctl, systemd-inhibit.
 # awake -> Control Center tile ("Stay awake"). Click toggles the last
-#          session; right-click opens the panel's Sleep view.
+#          session; right-click opens the panel's Awake view.
+#
+# assets/ holds Pond's power profile icons (github bflycomputer/
+# pond-interface, BSD-3: see assets/LICENSE-pond).
 #
 # Open it with: noctalia msg panel-toggle ishaan/rog-helper:panel
 
@@ -40,7 +44,7 @@ id = "panel"
 entry = "panel.luau"
 width = 316 # Pond panel width, the same as the other panels dropped from the right-hand cards
 height = "content" # the card hugs the main view: no empty strip above the nav row
-max_height = 640 # panel.luau MAX_H must match: room for notes under the main view; sub-views use 592 and scroll
+max_height = 680 # panel.luau MAX_H must match: room for notes under the main view; a sub-view hugs its rows too, or takes 592 and scrolls
 placement = "floating" # attached panels take the bar's opacity, and the Pond card bar is invisible
 position = "top_right" # opened from the right-hand cards: drops down in the same spot as the Pond panels
 open_near_click = false

@@ -1,6 +1,6 @@
 --!nonstrict
--- The panel's Power view: per power source profiles, CPU power limits per
--- mode, CPU boost. Changes go through rogctl (the panel's act); the building
+-- The panel's Power view: per power source profiles, a one-shot full
+-- charge, CPU power limits per mode, CPU boost. Changes go through rogctl (the panel's act); the building
 -- blocks and snapshots come from panel.luau through setup().
 
 local Power = {}
@@ -8,7 +8,7 @@ local Power = {}
 local B = nil
 local st, ex = {}, {} -- the panel's rogctl status / status-extra, fresh each render
 local picked, busy
-local num, has, act, render, PERF_LABEL
+local num, has, act, render, PERF_LABEL, TEXT_PAD
 local caption, label, section, choices, noteRow, toggleRow, packed, subHeader, loadingView
 
 local powerMode = nil -- which mode's CPU limits are being edited
@@ -17,9 +17,24 @@ local drafts = {} -- mode -> { pl1, pl2 } while editing
 function Power.setup(blocks)
   B = blocks
   picked, busy = B.picked, B.busy
-  num, has, act, render, PERF_LABEL = B.num, B.has, B.act, B.render, B.PERF_LABEL
+  num, has, act, render, PERF_LABEL, TEXT_PAD = B.num, B.has, B.act, B.render, B.PERF_LABEL, B.TEXT_PAD
   caption, label, section, choices, noteRow = B.caption, B.label, B.section, B.choices, B.noteRow
   toggleRow, packed, subHeader, loadingView = B.toggleRow, B.packed, B.subHeader, B.loadingView
+end
+
+-- Pond's grey action button (pond-panels Style.action: "Forget",
+-- "Disconnect"): #303030 with 10 px corners, #3D3D3D under the pointer, the
+-- label at 80% then full white. Noctalia's secondary button is a pale block
+-- that shouted over the row.
+local function actionButton(key, text, enabled, onClick)
+  local hovered = enabled and B.hover() == key
+  return ui.row({
+    key = key, height = 30, radius = 10, paddingH = 14, justify = "center", align = "center",
+    fill = hovered and "#3d3d3d" or "#303030", opacity = enabled and 1 or 0.4,
+    onClick = enabled and onClick or nil, onHover = B.hoverHandler(key),
+  }, {
+    ui.label({ text = text, fontSize = 13, fontWeight = "medium", color = hovered and "on_surface" or "on_surface/0.8" }),
+  })
 end
 
 -- Unsaved slider positions are dropped when the panel closes.
@@ -80,38 +95,53 @@ function Power.view()
     limits = section({
       label("CPU power limits", custom and "Custom" or "Firmware"),
       choices("segment", "plmode", modeTabs, mode),
-      ui.row({ align = "center", gap = 8 }, {
-        ui.row({ width = 76, align = "center" }, { ui.label({ text = "Sustained", fontSize = 12, color = "on_surface" }) }), -- a fixed column so both tracks start together
+      -- slider rows: the name on the text edge, the watts on the right one
+      ui.row({ align = "center", gap = 8, paddingH = TEXT_PAD }, {
+        ui.row({ width = 76, align = "center" }, { ui.label({ text = "Sustained", fontSize = 13, color = "on_surface" }) }), -- a fixed column so both tracks start together
         ui.slider({ key = "pl1:" .. mode, min = 5, max = max1, step = 1, value = d.pl1, flexGrow = 1, controlSize = "sm",
           onChange = function(v)
             d.pl1 = math.floor(tonumber(v) or d.pl1)
             if d.pl2 < d.pl1 then d.pl2 = d.pl1 end
             render()
           end }),
-        ui.label({ text = d.pl1 .. " W", fontSize = 12, fontFamily = "IBM Plex Mono", color = "on_surface/0.7", width = 44, textAlign = "end" }),
+        ui.label({ text = d.pl1 .. " W", fontSize = 13, fontFamily = "IBM Plex Mono", color = "on_surface/0.7", width = 44, textAlign = "end" }),
       }),
-      ui.row({ align = "center", gap = 8 }, {
-        ui.row({ width = 76, align = "center" }, { ui.label({ text = "Boost", fontSize = 12, color = "on_surface" }) }), -- a fixed column so both tracks start together
+      ui.row({ align = "center", gap = 8, paddingH = TEXT_PAD }, {
+        ui.row({ width = 76, align = "center" }, { ui.label({ text = "Boost", fontSize = 13, color = "on_surface" }) }), -- a fixed column so both tracks start together
         ui.slider({ key = "pl2:" .. mode, min = 5, max = max2, step = 1, value = d.pl2, flexGrow = 1, controlSize = "sm",
           onChange = function(v)
             d.pl2 = math.floor(tonumber(v) or d.pl2)
             if d.pl1 > d.pl2 then d.pl1 = d.pl2 end
             render()
           end }),
-        ui.label({ text = d.pl2 .. " W", fontSize = 12, fontFamily = "IBM Plex Mono", color = "on_surface/0.7", width = 44, textAlign = "end" }),
+        ui.label({ text = d.pl2 .. " W", fontSize = 13, fontFamily = "IBM Plex Mono", color = "on_surface/0.7", width = 44, textAlign = "end" }),
       }),
+      -- Pond's grey buttons, ending on the right edge with the watts above
       ui.row({ gap = 6, justify = "end" }, {
-        ui.button({ text = "Reset", controlSize = "sm", variant = "ghost", enabled = custom or changed, onClick = function()
+        actionButton("rapl:reset", "Reset", custom or changed, function()
           drafts[mode] = nil
           act("rapl", "reset", { "rapl", "reset", mode }, "extra")
-        end }),
-        -- Ghost while disabled: Noctalia's disabled secondary is a solid grey block.
-        ui.button({ text = "Apply", controlSize = "sm", variant = (changed and not busy.rapl) and "secondary" or "ghost", enabled = changed and not busy.rapl, onClick = function()
+        end),
+        actionButton("rapl:apply", "Apply", changed and not busy.rapl, function()
           act("rapl", "set", { "rapl", "set", mode, tostring(d.pl1), tostring(d.pl2) }, "extra")
           drafts[mode] = nil
-        end }),
+        end),
       }),
       noteRow("rapl") or caption("Caps only. Applying asks for your password"),
+    })
+  end
+  -- One full charge past the limit, then the limit again (asusctl's oneshot).
+  -- An action, not a setting, so a button rather than a fourth segment on
+  -- the main view's limit track.
+  local oneshot = nil
+  if has(st, "limit") then
+    local limit = num(st.limit)
+    oneshot = section({
+      ui.row({ align = "center", gap = 8, paddingH = TEXT_PAD }, {
+        ui.label({ text = "Charge to 100% once", fontSize = 13, fontWeight = "medium", color = "on_surface", flexGrow = 1, maxLines = 1 }),
+        actionButton("oneshot:go", "Charge", not busy.oneshot, function() act("oneshot", "go", { "oneshot" }) end),
+      }),
+      noteRow("oneshot") or caption(limit and limit < 100 and `Then it holds at {limit}% again` or "Charges past the limit one time"),
     })
   end
   local boost = has(ex, "boost") and toggleRow("CPU boost", (picked.boost or ex.boost) == "1", function(v)
@@ -120,21 +150,26 @@ function Power.view()
 
   return packed(
     subHeader("Power", "CPU base " .. (ex.cpu_base_power or "?") .. " W, dGPU " .. (ex.gpu_base_tgp or "?") .. " W"),
+    -- two sections, so "On battery" sits the rows' 14 below the track over
+    -- it rather than a cramped 6
     section({
       label("When plugged in"),
       choices("segment", "auto_ac", {
         { id = "balanced", label = "Balanced", onClick = auto("ac", "balanced") },
         { id = "turbo", label = "Turbo", onClick = auto("ac", "turbo") },
       }, acSel),
+      noteRow("auto_ac"),
+    }),
+    section({
       label("On battery"),
       choices("segment", "auto_battery", {
         { id = "silent", label = "Silent", onClick = auto("battery", "silent") },
         { id = "balanced", label = "Balanced", onClick = auto("battery", "balanced") },
         { id = "turbo", label = "Turbo", onClick = auto("battery", "turbo") },
       }, batSel),
-      noteRow("auto_ac"),
       batNote,
     }),
+    oneshot,
     limits,
     boost,
     boost and noteRow("boost")
